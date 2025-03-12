@@ -1,0 +1,9 @@
+[package]
+name = "sio_rs2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8.1"
+pin-project-lite = "0.2.16"
+tower = "0.5.2"
