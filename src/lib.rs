@@ -63,7 +63,7 @@ where
 }
 
 pin_project! {
-    struct EngineFuture<F> {
+    pub struct EngineFuture<F> {
         #[pin]
         inner: EngineFutureInner<F>,
     }
