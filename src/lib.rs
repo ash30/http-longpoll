@@ -1,8 +1,8 @@
 use axum::body::Body;
-use axum::extract::{FromRequestParts, Query};
+use axum::extract::{FromRequestParts, Query, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures::future::BoxFuture;
-use futures::{Sink, Stream};
+use futures::{Sink, Stream, StreamExt};
 use pin_project_lite::pin_project;
 use serde::Deserialize;
 use std::pin::Pin;
@@ -136,75 +136,24 @@ impl IntoResponse for EngineError {
     }
 }
 
-type ConnectionHandler =
-    Box<dyn FnOnce(Box<dyn Transport>) -> BoxFuture<'static, ()> + 'static + Send>;
-
-pub struct Engine {
-    // factory for actual transport
-    inner: Box<dyn FnOnce() -> Result<(Response, Box<dyn Transport>), Response> + 'static + Send>,
+pub enum Engine {
+    Websocket(WebSocketUpgrade),
+    Polling,
 }
 
-use futures::{future::BoxFuture, FutureExt}
 impl Engine {
-    pub fn on_connect<C, Fut>(self, callback: C) -> Response
+    fn on_connect<Fut, C>(self, callback: C) -> Response
     where
-        C: FnOnce() -> Fut + Send + 'static,
+        C: FnOnce(Box<dyn Stream<Item = EngineMessage>>) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let c = callback().boxed();
-
-        callback(self.inner)(Box::new(callback))
-    }
-}
-
-trait Transport {}
-
-trait TransportPrivate: Transport {
-    fn on_connect<C, Fut>(self, callback: C) -> Response
-    where
-        C: FnOnce(Transport) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static;
-}
-
-struct PollingTranport {}
-
-impl PollingTranport {
-    fn on_connect<C, Fut>(self, callback: C) -> Response
-    where
-        C: FnOnce(Transport) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-    }
-}
-
-impl Stream for PollingTranport {
-    type Item = EngineMessage;
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        todo!()
-    }
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
-    }
-}
-
-struct WebsocketTransport {}
-
-impl WebsocketTransport {
-    fn on_connect<C, Fut>(self, callback: C) -> Response
-    where
-        C: FnOnce(Transport) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-    }
-}
-
-impl Stream for WebsocketTransport {
-    type Item = EngineMessage;
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        todo!()
-    }
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
+        match self {
+            Engine::Websocket(ws) => ws.on_upgrade(|w| callback(Box::new(w))),
+            Engine::Polling => Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap(),
+        }
     }
 }
 
