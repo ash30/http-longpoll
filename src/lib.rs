@@ -1,8 +1,12 @@
-use axum::body::Body;
+#![feature(trace_macros)]
+
+//trace_macros!(true);
+
+use axum::body::{Body, Bytes};
+use axum::extract::ws::{Message, Utf8Bytes};
 use axum::extract::{FromRequestParts, Query, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use futures::future::BoxFuture;
-use futures::{Sink, Stream, StreamExt};
+use futures::future::Either;
 use pin_project_lite::pin_project;
 use serde::Deserialize;
 use std::pin::Pin;
@@ -116,9 +120,6 @@ where
     }
 }
 
-// ====
-//
-
 pub enum EngineError {
     Unknown,
     Session,
@@ -136,33 +137,164 @@ impl IntoResponse for EngineError {
     }
 }
 
-pub enum Engine {
-    Websocket(WebSocketUpgrade),
-    Polling,
-}
+pub mod transport {
+    use crate::EngineMessage;
+    use axum::response::Response;
+    use axum::Error;
+    use futures::{Sink, Stream};
+    use std::{future::Future, process::Output};
 
-impl Engine {
-    fn on_connect<Fut, C>(self, callback: C) -> Response
-    where
-        C: FnOnce(Box<dyn Stream<Item = EngineMessage>>) -> Fut,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        match self {
-            Engine::Websocket(ws) => ws.on_upgrade(|w| callback(Box::new(w))),
-            Engine::Polling => Response::builder()
-                .status(StatusCode::OK)
-                .body(Body::empty())
-                .unwrap(),
+    pub trait Transport {
+        type Socket: Send + 'static + Stream<Item = Result<EngineMessage, Error>>;
+
+        fn on_connect<C, Fut>(self, callback: C) -> Response
+        where
+            C: FnOnce(Self::Socket) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static;
+    }
+
+    pub mod ws {
+        use axum::extract::ws::WebSocketUpgrade;
+        use futures::Stream;
+        use pin_project_lite::pin_project;
+        use std::task::Poll;
+
+        pin_project! {
+            pub struct SocketAdapter {
+                #[pin]
+                pub inner: axum::extract::ws::WebSocket,
+            }
+        }
+
+        impl Stream for SocketAdapter {
+            type Item = Result<super::EngineMessage, super::Error>;
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.inner.size_hint()
+            }
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                let this = self.project();
+                match this.inner.poll_next(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Ready(Some(res)) => {
+                        Poll::Ready(Some(res.map(super::EngineMessage::from)))
+                    }
+                }
+            }
+        }
+
+        pub struct WebSocket {
+            pub inner: WebSocketUpgrade,
+        }
+
+        impl super::Transport for WebSocket {
+            type Socket = SocketAdapter;
+
+            fn on_connect<C, Fut>(self, callback: C) -> super::Response
+            where
+                C: FnOnce(Self::Socket) -> Fut + Send + 'static,
+                Fut: super::Future<Output = ()> + Send + 'static,
+            {
+                self.inner
+                    .on_upgrade(|s| callback(SocketAdapter { inner: s }))
+            }
         }
     }
 }
 
-enum EngineMessage {}
+macro_rules! engine_define {
+    (enum $name:ident {$($var:ident($p:path)),*}) => {
+        pub enum $name {
+            $(
+                $var($p),
+            )*
+        }
+
+        pub enum Socket {
+            $(
+                $var(<$p as transport::Transport>::Socket),
+            )*
+        }
+
+        $(
+            impl std::convert::From<<$p as transport::Transport>::Socket> for Socket {
+                fn from(value: <$p as transport::Transport>::Socket) -> Socket {
+                    Socket::$var(value)
+                }
+            }
+        )*
+
+        impl futures::Stream for Socket {
+            type Item = Result<crate::EngineMessage,axum::Error>;
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                todo!()
+            }
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                todo!()
+            }
+        }
+
+
+        impl transport::Transport for $name {
+            type Socket = Socket;
+
+            fn on_connect<C, Fut>(self, callback: C) -> Response
+            where
+                C: FnOnce(Self::Socket) -> Fut + Send + 'static,
+                Fut: Future<Output = ()> + Send + 'static,
+            {
+                match self {
+                    $(Self::$var(t) => t.on_connect(|s|callback(Socket::from(s))))*
+                }
+            }
+        }
+
+        $(
+            impl std::convert::From<$p> for $name {
+                fn from(value: $p) -> $name {
+                   Self::$var(value)
+                }
+            }
+        )*
+    };
+}
+
+engine_define! {
+    enum Engine {
+        WebSocket(transport::ws::WebSocket)
+    }
+}
+
+#[derive(Debug)]
+pub enum EngineMessage {
+    Open(Utf8Bytes),
+    Close(Utf8Bytes),
+    Ping(Bytes),
+    Pong(Bytes),
+    Msg(Bytes),
+    Upgrade,
+    Noop,
+}
+
+impl From<Message> for EngineMessage {
+    fn from(value: Message) -> Self {
+        todo!()
+    }
+}
 
 #[derive(Deserialize)]
 struct EngineQuery {
     transport: String,
-    eio: u8,
     sid: Option<String>,
 }
 
@@ -179,33 +311,38 @@ where
         let Ok(params) = Query::<EngineQuery>::from_request_parts(parts, state).await else {
             return Err(EngineError::QueryMalformed);
         };
-        // WE SHOULD NOT have a session at this point ...
-        if let Some(sid) = &params.sid {
+        if params.sid.is_some() {
             return Err(EngineError::Session);
         }
-        let inner = match params.transport.as_str() {
-            "polling" => TransportInner::Polling(PollingTranport {}),
-            "websocket" => TransportInner::Websocket(WebsocketTransport {}),
-            _ => return Err(EngineError::Unknown),
-        }
-        .into();
 
-        Ok(Engine {
-            inner: Box::new(|| inner),
-        })
+        let e = match params.transport.as_str() {
+            "websocket" => {
+                let Ok(upgrade) =
+                    axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, state).await
+                else {
+                    return Err(EngineError::Session);
+                };
+                Engine::from(transport::ws::WebSocket { inner: upgrade })
+            }
+            _ => return Err(EngineError::Unknown),
+        };
+        Ok(e)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{engine_io, Engine};
+    use crate::{engine_io, transport::Transport, Engine};
     use axum::{response::Response, Router};
+    use futures::StreamExt;
 
     #[test]
     fn init() {
         #[axum::debug_handler]
         async fn test(e: Engine) -> Response {
-            e.on_connect(|transport| async move {})
+            e.on_connect(|mut socket| async move {
+                let m = socket.next().await;
+            })
         }
         let s = engine_io(test, ());
         //let r: Router<()> = Router::new().route_service("/rtc", s); //.with_state(()));
