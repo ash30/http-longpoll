@@ -6,7 +6,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, Utf8Bytes};
 use axum::extract::{FromRequestParts, Query, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use futures::future::Either;
+use futures::Sink;
 use pin_project_lite::pin_project;
 use serde::Deserialize;
 use std::pin::Pin;
@@ -155,9 +155,12 @@ pub mod transport {
 
     pub mod ws {
         use axum::extract::ws::WebSocketUpgrade;
-        use futures::Stream;
+        use futures::{Sink, Stream};
         use pin_project_lite::pin_project;
-        use std::task::Poll;
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
 
         pin_project! {
             pub struct SocketAdapter {
@@ -187,6 +190,34 @@ pub mod transport {
                 }
             }
         }
+        impl Sink<super::EngineMessage> for SocketAdapter {
+            type Error = axum::Error;
+
+            fn poll_close(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+            fn start_send(
+                self: Pin<&mut Self>,
+                item: super::EngineMessage,
+            ) -> Result<(), Self::Error> {
+                todo!()
+            }
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+        }
 
         pub struct WebSocket {
             pub inner: WebSocketUpgrade,
@@ -204,6 +235,12 @@ pub mod transport {
                     .on_upgrade(|s| callback(SocketAdapter { inner: s }))
             }
         }
+    }
+}
+
+impl From<EngineMessage> for Message {
+    fn from(value: EngineMessage) -> Self {
+        todo!()
     }
 }
 
@@ -229,6 +266,22 @@ macro_rules! engine_define {
             }
         )*
 
+        use futures::stream::{self, StreamExt};
+        impl Socket {
+             pub async fn recv(&mut self) -> Option<Result<crate::EngineMessage, axum::Error>> {
+                self.next().await
+            }
+
+             pub async fn send1(&mut self, msg: crate::EngineMessage) -> Result<(), axum::Error> {
+                 todo!()
+             }
+
+             pub async fn send<T>(&mut self, msg:T) -> Result<(),axum::Error> where T:Into<EngineMessage> {
+                todo!()
+             }
+
+        }
+
         impl futures::Stream for Socket {
             type Item = Result<crate::EngineMessage,axum::Error>;
 
@@ -240,6 +293,22 @@ macro_rules! engine_define {
                 self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Option<Self::Item>> {
+                todo!()
+            }
+        }
+        impl Sink<EngineMessage> for Socket {
+            type Error = axum::Error;
+
+            fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+            fn start_send(self: Pin<&mut Self>, item: EngineMessage) -> Result<(), Self::Error> {
+                todo!()
+            }
+            fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
                 todo!()
             }
         }
