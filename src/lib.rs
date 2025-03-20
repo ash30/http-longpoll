@@ -6,12 +6,15 @@ use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, Utf8Bytes};
 use axum::extract::{FromRequestParts, Query, WebSocketUpgrade};
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures::Sink;
 use pin_project_lite::pin_project;
 use serde::Deserialize;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{ready, Context};
 use std::{convert::Infallible, future::Future, task::Poll};
+use uuid7::Uuid;
 
 use axum::{
     extract::Request,
@@ -19,11 +22,22 @@ use axum::{
     http::{status, Method, StatusCode},
     response::Response,
 };
+use tokio::sync::mpsc;
 use tower::Service;
+
+type PollingSessionRef = mpsc::Sender<Result<mpsc::Receiver<EngineMessage>, EngineError>>;
+
+type PollingSessionStore = Arc<papaya::HashMap<Uuid, PollingSessionRef>>;
 
 #[derive(Clone)]
 pub struct EngineService<S> {
     inner: S,
+    store: PollingSessionStore,
+}
+
+#[derive(Clone)]
+struct EngineReqExtension {
+    store: PollingSessionStore,
 }
 
 // EngineIO needs to be a service ? becaues it handles mutliple methods
@@ -33,6 +47,7 @@ pub fn engine_io<T, S: Clone, H: Handler<T, S>>(
 ) -> EngineService<HandlerService<H, T, S>> {
     EngineService {
         inner: handler.with_state(state),
+        store: papaya::HashMap::new().into(),
     }
 }
 
@@ -48,11 +63,16 @@ where
     type Error = S::Error;
     type Future = EngineServiceFuture<S::Future>;
 
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&mut self, mut req: Request) -> Self::Future {
         // We have to call handler with correct things....
         // IFF its a GET
         // else route to correct thing
-        //
+
+        // Set this up for *future* use
+        req.extensions_mut().insert(EngineReqExtension {
+            store: self.store.clone(),
+        });
+
         match *req.method() {
             Method::GET => {
                 // we need to match over transport query param here
@@ -151,6 +171,87 @@ pub mod transport {
         where
             C: FnOnce(Self::Socket) -> Fut + Send + 'static,
             Fut: Future<Output = ()> + Send + 'static;
+    }
+
+    pub mod polling {
+        use futures::{Sink, Stream};
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        use crate::PollingSessionStore;
+
+        use super::Transport;
+
+        pub struct Socket {}
+
+        impl Stream for Socket {
+            type Item = Result<super::EngineMessage, super::Error>;
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                todo!()
+            }
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                todo!()
+            }
+        }
+
+        impl Sink<super::EngineMessage> for Socket {
+            type Error = axum::Error;
+
+            fn poll_close(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+            fn start_send(
+                self: Pin<&mut Self>,
+                item: super::EngineMessage,
+            ) -> Result<(), Self::Error> {
+                todo!()
+            }
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                todo!()
+            }
+        }
+
+        pub struct HttpPolling {
+            store: PollingSessionStore,
+        }
+
+        impl HttpPolling {
+            pub(crate) fn new(store: PollingSessionStore) -> Self {
+                HttpPolling { store }
+            }
+        }
+
+        impl Transport for HttpPolling {
+            type Socket = Socket;
+            fn on_connect<C, Fut>(self, callback: C) -> axum::response::Response
+            where
+                C: FnOnce(Self::Socket) -> Fut + Send + 'static,
+                Fut: futures::prelude::Future<Output = ()> + Send + 'static,
+            {
+                // THIS HAS TO....
+                // spawn a task, call callback,
+                // needs a socket ...
+                // we need to create in hashmap and provide RX here ...
+                todo!()
+            }
+        }
     }
 
     pub mod ws {
@@ -323,7 +424,7 @@ macro_rules! engine_define {
                 Fut: Future<Output = ()> + Send + 'static,
             {
                 match self {
-                    $(Self::$var(t) => t.on_connect(|s|callback(Socket::from(s))))*
+                    $(Self::$var(t) => t.on_connect(|s|callback(Socket::from(s))),)*
                 }
             }
         }
@@ -340,7 +441,8 @@ macro_rules! engine_define {
 
 engine_define! {
     enum Engine {
-        WebSocket(transport::ws::WebSocket)
+        WebSocket(transport::ws::WebSocket),
+        Polling(transport::polling::HttpPolling)
     }
 }
 
@@ -393,11 +495,21 @@ where
                 };
                 Engine::from(transport::ws::WebSocket { inner: upgrade })
             }
+            "polling" => {
+                let Ok(ext) =
+                    Extension::<EngineReqExtension>::from_request_parts(parts, state).await
+                else {
+                    return Err(EngineError::Session);
+                };
+                Engine::from(transport::polling::HttpPolling::new(ext.store.clone()))
+            }
             _ => return Err(EngineError::Unknown),
         };
         Ok(e)
     }
 }
+
+// ====
 
 #[cfg(test)]
 mod tests {
