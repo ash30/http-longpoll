@@ -22,12 +22,17 @@ use axum::{
     http::{status, Method, StatusCode},
     response::Response,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{self, mpsc};
 use tower::Service;
 
-type PollingSessionRef = mpsc::Sender<Result<mpsc::Receiver<EngineMessage>, EngineError>>;
-
+type PollingSessionRef = mpsc::Sender<PollingMessage>;
 type PollingSessionStore = Arc<papaya::HashMap<Uuid, PollingSessionRef>>;
+
+enum PollingMessage {
+    Poll(sync::oneshot::Sender<Result<EngineMessage,EngineError>>),
+    Message(EngineMessage),
+    Close
+}
 
 #[derive(Clone)]
 pub struct EngineService<S> {
@@ -174,17 +179,46 @@ pub mod transport {
     }
 
     pub mod polling {
-        use futures::{Sink, Stream};
+        use futures::{Future, FutureExt, Sink, Stream};
+        use pin_project_lite::pin_project;
+        use uuid7::uuid7;
         use std::{
+            collections::VecDeque,
             pin::Pin,
+            sync::Arc,
+            sync::Mutex,
             task::{Context, Poll},
         };
+        use tokio::{
+            pin,
+            sync::{
+                self, futures::Notified, mpsc::{error::TrySendError, Permit}, oneshot::error::TryRecvError, Notify
+            },
+        };
 
-        use crate::PollingSessionStore;
+        use crate::{EngineMessage, PollingMessage, PollingSessionStore};
 
         use super::Transport;
+        use futures::future::BoxFuture;
 
-        pub struct Socket {}
+        pin_project! {
+            pub struct Socket {
+                tx: sync::mpsc::Sender<EngineMessage>,
+                pub notify: Arc<Notify>,
+                ready: Option<BoxFuture<Permit<'_,EngineMessage>>>,
+                #[pin]
+                flush: Option<Notified>,
+            }
+        }
+
+        impl Socket {
+            fn new(tx:sync::mpsc::Sender<EngineMessage>) -> Self {
+                let notify:Arc<Notify> = Notify::new().into();
+                Self {
+                    tx, notify: notify.clone(), ready:None, flush:None
+                }
+            }
+        }
 
         impl Stream for Socket {
             type Item = Result<super::EngineMessage, super::Error>;
@@ -206,25 +240,47 @@ pub mod transport {
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Result<(), Self::Error>> {
+                // WHAT ?
                 todo!()
             }
+
             fn poll_flush(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Result<(), Self::Error>> {
-                todo!()
+                let this = self.project();
+                if let Some(f) = this.flush.as_pin_mut() {
+                    match f.poll(cx) {
+                        Poll::Ready(_) => { self.flush = None; Poll::Ready(Ok(())) },
+                        Poll::Pending => Poll::Pending
+                    }
+                }
+                else {
+                    this.flush = Some(this.notify.notified());
+                    self.poll_flush(cx)
+                }
             }
+
             fn start_send(
                 self: Pin<&mut Self>,
                 item: super::EngineMessage,
             ) -> Result<(), Self::Error> {
-                todo!()
+                // Decide Error please!
+                self.tx.try_send(item).map_err(|e|todo!())
             }
+
             fn poll_ready(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Result<(), Self::Error>> {
-                todo!()
+                
+                // DONE 
+                if let Some(f) = self.ready {
+                    f.as_mut().poll(cx).map(|a|Ok(()))
+                } else {
+                    self.ready = Some(self.tx.reserve());
+                    self.poll_ready(cx)
+                }
             }
         }
 
@@ -245,11 +301,46 @@ pub mod transport {
                 C: FnOnce(Self::Socket) -> Fut + Send + 'static,
                 Fut: futures::prelude::Future<Output = ()> + Send + 'static,
             {
-                // THIS HAS TO....
-                // spawn a task, call callback,
-                // needs a socket ...
-                // we need to create in hashmap and provide RX here ...
-                todo!()
+                let (ses_tx,ses_rx) = sync::mpsc::channel(32);
+                let socket = Socket::new(ses_tx);
+                let n = socket.notify.clone();
+
+
+                let store = self.store.clone();
+                let store = store.pin();
+                let id = uuid7();
+                let (req_tx,req_rx) = sync::mpsc::channel(32);
+                store.insert(id.clone(),req_tx);
+
+
+                tokio::spawn(move || {
+                    let user_session = callback(socket);
+                    pin!(user_session);
+                    let p = None;
+                    loop {
+                        tokio::select! {
+                            _ = &mut user_session => break,
+                            Some(req) = req_rx.recv() => {
+                                match req {
+                                    PollingMessage::Poll(tx) => { p = Some(tx); n.notify_one(); }
+                                    PollingMessage::Close() => { 
+                                        ses_rx.close();
+                                        // How to drain ...
+                                    }
+                                    PollingMessage::Message(m) => {
+                                        // is there away to avoid all this channel stuff ?
+                                    }
+                                }
+
+                            }
+                        }
+                    }
+                    // After loop clean up store? 
+                    store.remove(&id)
+
+                })
+
+                // The reponse needs to include the SIO id ...
             }
         }
     }
@@ -372,10 +463,6 @@ macro_rules! engine_define {
              pub async fn recv(&mut self) -> Option<Result<crate::EngineMessage, axum::Error>> {
                 self.next().await
             }
-
-             pub async fn send1(&mut self, msg: crate::EngineMessage) -> Result<(), axum::Error> {
-                 todo!()
-             }
 
              pub async fn send<T>(&mut self, msg:T) -> Result<(),axum::Error> where T:Into<EngineMessage> {
                 todo!()
