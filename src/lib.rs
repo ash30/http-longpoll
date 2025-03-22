@@ -29,9 +29,8 @@ type PollingSessionRef = mpsc::Sender<PollingMessage>;
 type PollingSessionStore = Arc<papaya::HashMap<Uuid, PollingSessionRef>>;
 
 enum PollingMessage {
-    Poll(sync::oneshot::Sender<Result<EngineMessage,EngineError>>),
+    Poll(sync::oneshot::Sender<Result<EngineMessage, EngineError>>),
     Message(EngineMessage),
-    Close
 }
 
 #[derive(Clone)]
@@ -179,57 +178,79 @@ pub mod transport {
     }
 
     pub mod polling {
+        use axum::{
+            body::Body,
+            http::{request::Builder, Response},
+            response::Response,
+        };
         use futures::{Future, FutureExt, Sink, Stream};
         use pin_project_lite::pin_project;
-        use uuid7::uuid7;
         use std::{
+            cell::RefCell,
             collections::VecDeque,
             pin::Pin,
-            sync::Arc,
-            sync::Mutex,
+            sync::{Arc, Mutex},
             task::{Context, Poll},
         };
         use tokio::{
             pin,
             sync::{
-                self, futures::Notified, mpsc::{error::TrySendError, Permit}, oneshot::error::TryRecvError, Notify
+                self,
+                futures::Notified,
+                mpsc::{error::TrySendError, Permit},
+                oneshot::error::TryRecvError,
+                Notify,
             },
         };
+        use uuid7::uuid7;
 
-        use crate::{EngineMessage, PollingMessage, PollingSessionStore};
+        use crate::{EngineError, EngineMessage, PollingMessage, PollingSessionStore};
 
         use super::Transport;
         use futures::future::BoxFuture;
 
         pin_project! {
             pub struct Socket {
-                tx: sync::mpsc::Sender<EngineMessage>,
-                pub notify: Arc<Notify>,
-                ready: Option<BoxFuture<Permit<'_,EngineMessage>>>,
                 #[pin]
-                flush: Option<Notified>,
-            }
-        }
-
-        impl Socket {
-            fn new(tx:sync::mpsc::Sender<EngineMessage>) -> Self {
-                let notify:Arc<Notify> = Notify::new().into();
-                Self {
-                    tx, notify: notify.clone(), ready:None, flush:None
-                }
+                rx: sync::mpsc::Receiver<PollingMessage>,
+                polling: Option<tokio::sync::oneshot::Sender<Result<EngineMessage, EngineError>>>,
             }
         }
 
         impl Stream for Socket {
             type Item = Result<super::EngineMessage, super::Error>;
-            fn size_hint(&self) -> (usize, Option<usize>) {
-                todo!()
-            }
+
             fn poll_next(
                 self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Option<Self::Item>> {
-                todo!()
+                let mut this = self.project();
+                loop {
+                    match this.rx.poll_recv(cx) {
+                        Poll::Pending => break Poll::Pending,
+                        Poll::Ready(None) => {
+                            // Q. should we flush outstanding polls ?
+                            // Q. what happens with remaining
+                            // Feels liks RESULT ERR is used to inform of closure ....
+                            // We should return error + remaining buffer
+                            break Poll::Ready(None);
+                        }
+                        Poll::Ready(Some(PollingMessage::Poll(tx))) => {
+                            if this.polling.is_some() {
+                                // return error + close down
+                                this.rx.close();
+                                // send error down tx
+                                // send error down existi tx
+                                break Poll::Ready(None);
+                            }
+                            this.polling.replace(tx);
+                            continue;
+                        }
+                        Poll::Ready(Some(PollingMessage::Message(m))) => {
+                            break Poll::Ready(Some(Ok(m)))
+                        }
+                    }
+                }
             }
         }
 
@@ -248,17 +269,7 @@ pub mod transport {
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Result<(), Self::Error>> {
-                let this = self.project();
-                if let Some(f) = this.flush.as_pin_mut() {
-                    match f.poll(cx) {
-                        Poll::Ready(_) => { self.flush = None; Poll::Ready(Ok(())) },
-                        Poll::Pending => Poll::Pending
-                    }
-                }
-                else {
-                    this.flush = Some(this.notify.notified());
-                    self.poll_flush(cx)
-                }
+                todo!()
             }
 
             fn start_send(
@@ -266,21 +277,14 @@ pub mod transport {
                 item: super::EngineMessage,
             ) -> Result<(), Self::Error> {
                 // Decide Error please!
-                self.tx.try_send(item).map_err(|e|todo!())
+                todo!()
             }
 
             fn poll_ready(
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Result<(), Self::Error>> {
-                
-                // DONE 
-                if let Some(f) = self.ready {
-                    f.as_mut().poll(cx).map(|a|Ok(()))
-                } else {
-                    self.ready = Some(self.tx.reserve());
-                    self.poll_ready(cx)
-                }
+                todo!()
             }
         }
 
@@ -299,48 +303,8 @@ pub mod transport {
             fn on_connect<C, Fut>(self, callback: C) -> axum::response::Response
             where
                 C: FnOnce(Self::Socket) -> Fut + Send + 'static,
-                Fut: futures::prelude::Future<Output = ()> + Send + 'static,
+                Fut: Future<Output = ()> + Send + 'static,
             {
-                let (ses_tx,ses_rx) = sync::mpsc::channel(32);
-                let socket = Socket::new(ses_tx);
-                let n = socket.notify.clone();
-
-
-                let store = self.store.clone();
-                let store = store.pin();
-                let id = uuid7();
-                let (req_tx,req_rx) = sync::mpsc::channel(32);
-                store.insert(id.clone(),req_tx);
-
-
-                tokio::spawn(move || {
-                    let user_session = callback(socket);
-                    pin!(user_session);
-                    let p = None;
-                    loop {
-                        tokio::select! {
-                            _ = &mut user_session => break,
-                            Some(req) = req_rx.recv() => {
-                                match req {
-                                    PollingMessage::Poll(tx) => { p = Some(tx); n.notify_one(); }
-                                    PollingMessage::Close() => { 
-                                        ses_rx.close();
-                                        // How to drain ...
-                                    }
-                                    PollingMessage::Message(m) => {
-                                        // is there away to avoid all this channel stuff ?
-                                    }
-                                }
-
-                            }
-                        }
-                    }
-                    // After loop clean up store? 
-                    store.remove(&id)
-
-                })
-
-                // The reponse needs to include the SIO id ...
             }
         }
     }
@@ -528,7 +492,7 @@ macro_rules! engine_define {
 
 engine_define! {
     enum Engine {
-        WebSocket(transport::ws::WebSocket),
+        //WebSocket(transport::ws::WebSocket),
         Polling(transport::polling::HttpPolling)
     }
 }
