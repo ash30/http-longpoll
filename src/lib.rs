@@ -7,9 +7,10 @@ use axum::extract::ws::{Message, Utf8Bytes};
 use axum::extract::{FromRequestParts, Query, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Extension;
-use futures::Sink;
+use futures::{Sink, Stream};
 use pin_project_lite::pin_project;
 use serde::Deserialize;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context};
@@ -22,26 +23,66 @@ use axum::{
     http::{status, Method, StatusCode},
     response::Response,
 };
-use tokio::sync::{self, mpsc};
+use tokio::sync::{self, mpsc, oneshot};
 use tower::Service;
 
-type PollingSessionRef = mpsc::Sender<PollingMessage>;
-type PollingSessionStore = Arc<papaya::HashMap<Uuid, PollingSessionRef>>;
+type ResponseCallback = oneshot::Sender<Response>;
 
-enum PollingMessage {
-    Poll(sync::oneshot::Sender<Result<EngineMessage, EngineError>>),
-    Message(EngineMessage),
+#[derive(Debug, Clone)]
+struct HTTPSessionStore<K: Hash + Eq> {
+    ss: Arc<papaya::HashMap<K, mpsc::Sender<(Request, ResponseCallback)>>>,
+}
+
+impl<K> HTTPSessionStore<K>
+where
+    K: Hash + Eq,
+{
+    fn new() -> Self {
+        Self {
+            ss: papaya::HashMap::new().into(),
+        }
+    }
+
+    fn add(&self, k: K, capacity: usize) -> Result<HTTPSession, ()> {
+        let map = self.ss.pin();
+        let (tx, rx) = mpsc::channel(capacity);
+        Ok(HTTPSession { rx })
+    }
+
+    fn remove(&self, k: K) {
+        todo!()
+    }
+
+    // TODO: Define Error !
+    async fn forward(&self, k: K, req: Request) -> Result<Response, ()> {
+        todo!()
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    struct HTTPSession {
+        rx: mpsc::Receiver<(Request, ResponseCallback)>,
+    }
+}
+
+impl Stream for HTTPSession {
+    type Item = (Request, oneshot::Sender<Response>);
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.rx.poll_recv(cx)
+    }
 }
 
 #[derive(Clone)]
 pub struct EngineService<S> {
     inner: S,
-    store: PollingSessionStore,
+    store: HTTPSessionStore<Uuid>,
 }
 
 #[derive(Clone)]
 struct EngineReqExtension {
-    store: PollingSessionStore,
+    store: HTTPSessionStore<Uuid>,
 }
 
 // EngineIO needs to be a service ? becaues it handles mutliple methods
@@ -51,7 +92,7 @@ pub fn engine_io<T, S: Clone, H: Handler<T, S>>(
 ) -> EngineService<HandlerService<H, T, S>> {
     EngineService {
         inner: handler.with_state(state),
-        store: papaya::HashMap::new().into(),
+        store: HTTPSessionStore::new(),
     }
 }
 
@@ -179,82 +220,51 @@ pub mod transport {
 
     pub mod polling {
         use axum::{
-            body::Body,
-            http::{request::Builder, Response},
-            response::Response,
+            body::{Body, Bytes, HttpBody},
+            extract::Request,
+            http::Request,
         };
         use futures::{Future, FutureExt, Sink, Stream};
         use pin_project_lite::pin_project;
         use std::{
-            cell::RefCell,
             collections::VecDeque,
             pin::Pin,
             sync::{Arc, Mutex},
             task::{Context, Poll},
         };
-        use tokio::{
-            pin,
-            sync::{
-                self,
-                futures::Notified,
-                mpsc::{error::TrySendError, Permit},
-                oneshot::error::TryRecvError,
-                Notify,
-            },
-        };
-        use uuid7::uuid7;
-
-        use crate::{EngineError, EngineMessage, PollingMessage, PollingSessionStore};
 
         use super::Transport;
-        use futures::future::BoxFuture;
+        use crate::{HTTPSession, HTTPSessionStore, ResponseCallback};
 
         pin_project! {
-            pub struct Socket {
-                #[pin]
-                rx: sync::mpsc::Receiver<PollingMessage>,
-                polling: Option<tokio::sync::oneshot::Sender<Result<EngineMessage, EngineError>>>,
+            pub struct Socket<Msg:TryFrom<Request>> {
+                inner:HTTPSession,
+                next:Option<ResponseCallback>,
+                in_buf: VecDeque<Result<Msg,Msg::Error>>,
+                out_buf: VecDeque<Msg>,
             }
         }
 
-        impl Stream for Socket {
-            type Item = Result<super::EngineMessage, super::Error>;
+        impl<M> Socket<M> where M: TryFrom<Request> {}
+
+        impl<M> Stream for Socket<M>
+        where
+            M: TryFrom<Request>,
+        {
+            type Item = Result<M, M::Error>;
 
             fn poll_next(
                 self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Option<Self::Item>> {
-                let mut this = self.project();
-                loop {
-                    match this.rx.poll_recv(cx) {
-                        Poll::Pending => break Poll::Pending,
-                        Poll::Ready(None) => {
-                            // Q. should we flush outstanding polls ?
-                            // Q. what happens with remaining
-                            // Feels liks RESULT ERR is used to inform of closure ....
-                            // We should return error + remaining buffer
-                            break Poll::Ready(None);
-                        }
-                        Poll::Ready(Some(PollingMessage::Poll(tx))) => {
-                            if this.polling.is_some() {
-                                // return error + close down
-                                this.rx.close();
-                                // send error down tx
-                                // send error down existi tx
-                                break Poll::Ready(None);
-                            }
-                            this.polling.replace(tx);
-                            continue;
-                        }
-                        Poll::Ready(Some(PollingMessage::Message(m))) => {
-                            break Poll::Ready(Some(Ok(m)))
-                        }
-                    }
-                }
+                todo!()
             }
         }
 
-        impl Sink<super::EngineMessage> for Socket {
+        impl<M> Sink<super::EngineMessage> for Socket<M>
+        where
+            M: TryFrom<Request>,
+        {
             type Error = axum::Error;
 
             fn poll_close(
@@ -289,11 +299,11 @@ pub mod transport {
         }
 
         pub struct HttpPolling {
-            store: PollingSessionStore,
+            store: HTTPSessionStore,
         }
 
         impl HttpPolling {
-            pub(crate) fn new(store: PollingSessionStore) -> Self {
+            pub(crate) fn new(store: HTTPSessionStore) -> Self {
                 HttpPolling { store }
             }
         }
