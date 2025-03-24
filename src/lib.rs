@@ -10,6 +10,7 @@ use axum::Extension;
 use futures::{Sink, Stream};
 use pin_project_lite::pin_project;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,11 +67,112 @@ pin_project! {
     }
 }
 
+impl HTTPSession {
+    fn is_closed(&self) -> bool {
+        self.rx.is_closed()
+    }
+}
+
 impl Stream for HTTPSession {
     type Item = (Request, oneshot::Sender<Response>);
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         this.rx.poll_recv(cx)
+    }
+}
+
+pin_project! {
+    pub struct HTTPPollingSession<T:IntoResponse> {
+        #[pin]
+        inner:HTTPSession,
+        next:Option<ResponseCallback>,
+        in_buf: VecDeque<Request>,
+        out: Option<T>,
+    }
+}
+
+impl<T> HTTPPollingSession<T>
+where
+    T: IntoResponse,
+{
+    fn poll_loop(self: Pin<&mut Self>, cx: &mut Context<'_>) {
+        let this = self.project();
+        loop {
+            match this.inner.poll_next(cx) {
+                Poll::Pending => break,
+            }
+        }
+    }
+}
+
+impl<T> Stream for HTTPPollingSession<T>
+where
+    T: IntoResponse,
+{
+    type Item = Request;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.inner.is_closed() {
+            Poll::Ready(None)
+        } else {
+            self.poll_loop(cx);
+            let this = self.project();
+            this.in_buf
+                .pop_front()
+                .map(Some)
+                .map(Poll::Ready)
+                .unwrap_or(Poll::Pending)
+        }
+    }
+}
+
+impl<T> Sink<T> for HTTPPollingSession<T>
+where
+    T: IntoResponse,
+{
+    type Error = axum::Error;
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // todo
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.out.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(callback) = self.next {
+            let this = self.project();
+            if let Err(e) = callback.send(this.out.take().unwrap().into_response()) {
+                Poll::Ready(Err())
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        } else {
+            self.poll_loop(cx);
+            if self.next.is_some() {
+                self.poll_flush(cx)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        let this = self.project();
+        this.out.replace(item);
+        Ok(())
+    }
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.out.is_some() {
+            self.poll_flush(cx)
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 }
 
@@ -219,85 +321,6 @@ pub mod transport {
     }
 
     pub mod polling {
-        use axum::{
-            body::{Body, Bytes, HttpBody},
-            extract::Request,
-            http::Request,
-        };
-        use futures::{Future, FutureExt, Sink, Stream};
-        use pin_project_lite::pin_project;
-        use std::{
-            collections::VecDeque,
-            pin::Pin,
-            sync::{Arc, Mutex},
-            task::{Context, Poll},
-        };
-
-        use super::Transport;
-        use crate::{HTTPSession, HTTPSessionStore, ResponseCallback};
-
-        pin_project! {
-            pub struct Socket<Msg:TryFrom<Request>> {
-                inner:HTTPSession,
-                next:Option<ResponseCallback>,
-                in_buf: VecDeque<Result<Msg,Msg::Error>>,
-                out_buf: VecDeque<Msg>,
-            }
-        }
-
-        impl<M> Socket<M> where M: TryFrom<Request> {}
-
-        impl<M> Stream for Socket<M>
-        where
-            M: TryFrom<Request>,
-        {
-            type Item = Result<M, M::Error>;
-
-            fn poll_next(
-                self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Option<Self::Item>> {
-                todo!()
-            }
-        }
-
-        impl<M> Sink<super::EngineMessage> for Socket<M>
-        where
-            M: TryFrom<Request>,
-        {
-            type Error = axum::Error;
-
-            fn poll_close(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<Result<(), Self::Error>> {
-                // WHAT ?
-                todo!()
-            }
-
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<Result<(), Self::Error>> {
-                todo!()
-            }
-
-            fn start_send(
-                self: Pin<&mut Self>,
-                item: super::EngineMessage,
-            ) -> Result<(), Self::Error> {
-                // Decide Error please!
-                todo!()
-            }
-
-            fn poll_ready(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<Result<(), Self::Error>> {
-                todo!()
-            }
-        }
-
         pub struct HttpPolling {
             store: HTTPSessionStore,
         }
@@ -500,12 +523,12 @@ macro_rules! engine_define {
     };
 }
 
-engine_define! {
-    enum Engine {
-        //WebSocket(transport::ws::WebSocket),
-        Polling(transport::polling::HttpPolling)
-    }
-}
+//engine_define! {
+//    enum Engine {
+//        //WebSocket(transport::ws::WebSocket),
+//        Polling(transport::polling::HttpPolling)
+//    }
+//}
 
 #[derive(Debug)]
 pub enum EngineMessage {
@@ -530,45 +553,45 @@ struct EngineQuery {
     sid: Option<String>,
 }
 
-impl<S> FromRequestParts<S> for Engine
-where
-    S: Send + Sync,
-{
-    type Rejection = EngineError;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let Ok(params) = Query::<EngineQuery>::from_request_parts(parts, state).await else {
-            return Err(EngineError::QueryMalformed);
-        };
-        if params.sid.is_some() {
-            return Err(EngineError::Session);
-        }
-
-        let e = match params.transport.as_str() {
-            "websocket" => {
-                let Ok(upgrade) =
-                    axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, state).await
-                else {
-                    return Err(EngineError::Session);
-                };
-                Engine::from(transport::ws::WebSocket { inner: upgrade })
-            }
-            "polling" => {
-                let Ok(ext) =
-                    Extension::<EngineReqExtension>::from_request_parts(parts, state).await
-                else {
-                    return Err(EngineError::Session);
-                };
-                Engine::from(transport::polling::HttpPolling::new(ext.store.clone()))
-            }
-            _ => return Err(EngineError::Unknown),
-        };
-        Ok(e)
-    }
-}
+//impl<S> FromRequestParts<S> for Engine
+//where
+//    S: Send + Sync,
+//{
+//    type Rejection = EngineError;
+//
+//    async fn from_request_parts(
+//        parts: &mut axum::http::request::Parts,
+//        state: &S,
+//    ) -> Result<Self, Self::Rejection> {
+//        let Ok(params) = Query::<EngineQuery>::from_request_parts(parts, state).await else {
+//            return Err(EngineError::QueryMalformed);
+//        };
+//        if params.sid.is_some() {
+//            return Err(EngineError::Session);
+//        }
+//
+//        let e = match params.transport.as_str() {
+//            "websocket" => {
+//                let Ok(upgrade) =
+//                    axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, state).await
+//                else {
+//                    return Err(EngineError::Session);
+//                };
+//                Engine::from(transport::ws::WebSocket { inner: upgrade })
+//            }
+//            "polling" => {
+//                let Ok(ext) =
+//                    Extension::<EngineReqExtension>::from_request_parts(parts, state).await
+//                else {
+//                    return Err(EngineError::Session);
+//                };
+//                Engine::from(transport::polling::HttpPolling::new(ext.store.clone()))
+//            }
+//            _ => return Err(EngineError::Unknown),
+//        };
+//        Ok(e)
+//    }
+//}
 
 // ====
 
