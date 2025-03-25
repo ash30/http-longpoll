@@ -1,5 +1,5 @@
 extern crate sio_rs2;
-use sio_rs2::Socket;
+use sio_rs2::DuplexSession;
 
 use axum::extract::ws::{Message, Utf8Bytes};
 use axum::{body::Bytes, response::IntoResponse, routing::any, Router};
@@ -81,7 +81,7 @@ async fn ws_handler(
 }
 
 /// Actual websocket statemachine (one will be spawned per connection)
-async fn handle_socket(mut socket: Socket, who: SocketAddr) {
+async fn handle_socket(mut socket: DuplexSession, who: SocketAddr) {
     // send a ping (unsupported by some browsers) just to kick things off and get a response
     if socket
         .send(Message::Ping(Bytes::from_static(&[1, 2, 3])))
