@@ -91,6 +91,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-eio"
+version = "0.1.0"
+
+[[package]]
 name = "axum-extra"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -110,6 +114,27 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "axum-longpoll"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-extra",
+ "bytes",
+ "futures",
+ "futures-util",
+ "headers",
+ "papaya",
+ "pin-project-lite",
+ "serde",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid7",
 ]
 
 [[package]]
@@ -912,27 +937,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9e9e0b4211b72e7b8b6e85c807d36c212bdb33ea8587f7569562a84df5465b1"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "sio_rs2"
-version = "0.1.0"
-dependencies = [
- "axum",
- "axum-extra",
- "bytes",
- "futures",
- "futures-util",
- "headers",
- "papaya",
- "pin-project-lite",
- "serde",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid7",
 ]
 
 [[package]]
