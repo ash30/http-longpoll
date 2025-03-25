@@ -7,8 +7,11 @@ use axum::extract::ws::{Message, Utf8Bytes};
 use axum::extract::{FromRequestParts, Query, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Extension;
-use futures::{Sink, Stream};
+use bytes::buf::Chain;
+use bytes::Buf;
+use futures::{stream, Sink, Stream, StreamExt};
 use pin_project_lite::pin_project;
+use serde::de::Error;
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::hash::Hash;
@@ -81,6 +84,7 @@ impl Stream for HTTPSession {
     }
 }
 
+// Out needs to be Into Response, but really, we've lost http semantics at this point
 pin_project! {
     pub struct HTTPPollingSession<T:IntoResponse> {
         #[pin]
@@ -170,6 +174,84 @@ where
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if self.out.is_some() {
             self.poll_flush(cx)
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
+pin_project! {
+    struct Framer<W> {
+        #[pin]
+        inner: W,
+        buf: VecDeque<Bytes>,
+        max_size:usize
+    }
+}
+
+// delegate
+impl<W> Stream for Framer<W>
+where
+    W: Stream,
+{
+    type Item = W::Item;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_next(cx)
+    }
+}
+
+impl<W> Framer<W>
+where
+    W: Sink<Response>,
+{
+    fn poll_empty(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), W::Error>> {
+        let this = self.project();
+        loop {
+            if self.buf.len() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            ready!(this.inner.poll_ready(cx))?;
+            let limit = this.max_size;
+            let mut cur_size = 0;
+            let body = stream::iter(
+                this.buf
+                    .iter_mut()
+                    .take_while(|x| {
+                        cur_size != x.len();
+                        cur_size < limit
+                    })
+                    .collect(),
+            );
+            if let Err(e) = this.inner.start_send(Response::from(body)) {
+                return Poll::Ready(Err(e));
+            }
+        }
+    }
+}
+
+impl<W> Sink<Bytes> for Framer<W>
+where
+    W: Sink<Response>,
+{
+    type Error = W::Error;
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.poll_flush(cx))?;
+        self.project().inner.poll_close(cx)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_empty(cx);
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        self.project().buf.push_back(item);
+        Ok(())
+    }
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.buf.len() > self.max_size {
+            self.poll_empty(cx)
         } else {
             Poll::Ready(Ok(()))
         }
