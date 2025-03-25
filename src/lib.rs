@@ -74,6 +74,9 @@ impl HTTPSession {
     fn is_closed(&self) -> bool {
         self.rx.is_closed()
     }
+    fn close(&mut self) {
+        self.rx.close()
+    }
 }
 
 impl Stream for HTTPSession {
@@ -99,13 +102,8 @@ impl<T> HTTPPollingSession<T>
 where
     T: IntoResponse,
 {
-    fn poll_loop(self: Pin<&mut Self>, cx: &mut Context<'_>) {
-        let this = self.project();
-        loop {
-            match this.inner.poll_next(cx) {
-                Poll::Pending => break,
-            }
-        }
+    fn poll_loop(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), axum::Error>> {
+        todo!()
     }
 }
 
@@ -140,42 +138,44 @@ where
     type Error = axum::Error;
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // todo
-        Poll::Ready(Ok(()))
+        self.inner.as_mut().close();
+        self.poll_loop(cx)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.out.is_none() {
-            return Poll::Ready(Ok(()));
-        }
-        if let Some(callback) = self.next {
-            let this = self.project();
-            if let Err(e) = callback.send(this.out.take().unwrap().into_response()) {
-                Poll::Ready(Err())
-            } else {
-                Poll::Ready(Ok(()))
+        loop {
+            if self.out.is_none() {
+                return Poll::Ready(Ok(()));
             }
-        } else {
-            self.poll_loop(cx);
-            if self.next.is_some() {
-                self.poll_flush(cx)
+            if let Some(callback) = self.next {
+                let this = self.project();
+                if let Err(e) = callback.send(this.out.take().unwrap().into_response()) {
+                    return Poll::Ready(Err(todo!()));
+                }
             } else {
-                Poll::Pending
+                ready!(self.poll_loop(cx))?;
             }
         }
     }
 
     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
-        let this = self.project();
-        this.out.replace(item);
-        Ok(())
+        if self.out.is_some() {
+            Err(todo!());
+        } else {
+            self.project().out.replace(item);
+            Ok(())
+        }
     }
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.out.is_some() {
-            self.poll_flush(cx)
-        } else {
-            Poll::Ready(Ok(()))
+        loop {
+            if self.out.is_some() {
+                ready!(self.poll_flush(cx))?;
+            }
+            if self.next.is_some() {
+                return Poll::Ready(Ok(()));
+            }
+            ready!(self.poll_loop(cx))?;
         }
     }
 }
