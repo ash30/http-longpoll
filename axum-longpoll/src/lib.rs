@@ -262,8 +262,6 @@ struct EngineReqExtension<K: Eq + Hash> {
 
 #[cfg(test)]
 mod tests {
-    use axum::response::{IntoResponse, Response};
-
     #[test]
     fn init() {}
 }
