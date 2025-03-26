@@ -544,6 +544,7 @@ dependencies = [
  "axum",
  "axum-longpoll",
  "tokio",
+ "uuid7",
 ]
 
 [[package]]

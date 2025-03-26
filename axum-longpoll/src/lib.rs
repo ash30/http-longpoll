@@ -3,10 +3,12 @@
 //trace_macros!(true);
 
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::ExtensionRejection;
+use axum::extract::FromRequestParts;
 use axum::response::IntoResponse;
 use axum::Extension;
 use axum::{extract::Request, response::Response};
-use futures::{stream, Sink, Stream, StreamExt};
+use futures::{stream, Future, Sink, Stream};
 use pin_project_lite::pin_project;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -15,18 +17,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use tokio::sync::{mpsc, oneshot};
-use tower::{Layer, Service};
 
 type ResponseCallback = oneshot::Sender<Response>;
 
 pin_project! {
     #[derive(Debug)]
-    struct HTTPSession {
+    pub struct ReqStream {
         rx: mpsc::Receiver<(Request, ResponseCallback)>,
     }
 }
 
-impl HTTPSession {
+impl ReqStream {
     fn is_closed(&self) -> bool {
         self.rx.is_closed()
     }
@@ -35,7 +36,7 @@ impl HTTPSession {
     }
 }
 
-impl Stream for HTTPSession {
+impl Stream for ReqStream {
     type Item = (Request, oneshot::Sender<Response>);
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -45,27 +46,27 @@ impl Stream for HTTPSession {
 
 // Out needs to be Into Response, but really, we've lost http semantics at this point
 pin_project! {
-    pub struct HTTPPollingSession<T:IntoResponse> {
+    pub struct HTTPPoll<Res:IntoResponse> {
         #[pin]
-        inner:HTTPSession,
+        inner:ReqStream,
         next:Option<ResponseCallback>,
-        in_buf: VecDeque<Request>,
-        out: Option<T>,
+        rx_buf: VecDeque<Request>,
+        tx: Option<Res>,
     }
 }
 
-impl<T> HTTPPollingSession<T>
+impl<Res> HTTPPoll<Res>
 where
-    T: IntoResponse,
+    Res: IntoResponse,
 {
     fn poll_loop(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), axum::Error>> {
         todo!()
     }
 }
 
-impl<T> Stream for HTTPPollingSession<T>
+impl<Res> Stream for HTTPPoll<Res>
 where
-    T: IntoResponse,
+    Res: IntoResponse,
 {
     type Item = Request;
 
@@ -78,7 +79,7 @@ where
         } else {
             self.as_mut().poll_loop(cx);
             let this = self.project();
-            this.in_buf
+            this.rx_buf
                 .pop_front()
                 .map(Some)
                 .map(Poll::Ready)
@@ -87,9 +88,9 @@ where
     }
 }
 
-impl<T> Sink<T> for HTTPPollingSession<T>
+impl<Res> Sink<Res> for HTTPPoll<Res>
 where
-    T: IntoResponse,
+    Res: IntoResponse,
 {
     type Error = axum::Error;
 
@@ -100,14 +101,15 @@ where
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         loop {
-            if self.out.is_none() {
+            if self.tx.is_none() {
                 return Poll::Ready(Ok(()));
             }
             if let Some(callback) = self.next.take() {
                 if let Err(_) =
-                    callback.send(self.as_mut().project().out.take().unwrap().into_response())
+                    callback.send(self.as_mut().project().tx.take().unwrap().into_response())
                 {
-                    return Poll::Ready(Err(todo!()));
+                    todo!()
+                    //return Poll::Ready(Err(todo!()));
                 }
             } else {
                 ready!(self.as_mut().poll_loop(cx))?;
@@ -115,18 +117,19 @@ where
         }
     }
 
-    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
-        if self.out.is_some() {
-            Err(todo!());
+    fn start_send(self: Pin<&mut Self>, item: Res) -> Result<(), Self::Error> {
+        if self.tx.is_some() {
+            todo!()
+            // Err(todo!());
         } else {
-            self.project().out.replace(item);
+            self.project().tx.replace(item);
             Ok(())
         }
     }
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         loop {
-            if self.out.is_some() {
+            if self.tx.is_some() {
                 ready!(self.as_mut().poll_flush(cx))?;
             }
             if self.next.is_some() {
@@ -138,7 +141,7 @@ where
 }
 
 pin_project! {
-    struct Framer<W> {
+    pub struct Framer<W:Sink<Response>> {
         #[pin]
         inner: W,
         buf: VecDeque<Bytes>,
@@ -149,7 +152,7 @@ pin_project! {
 // delegate
 impl<W> Stream for Framer<W>
 where
-    W: Stream,
+    W: Stream + Sink<Response>,
 {
     type Item = W::Item;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -221,17 +224,23 @@ where
     }
 }
 
+pub type Session = Framer<HTTPPoll<Response>>;
+
 // ==========
 
 type LongpollTX = mpsc::Sender<(Request, ResponseCallback)>;
 
+#[derive(Clone, Debug)]
 pub struct _Longpoll<K, M> {
     store: M,
     _key: PhantomData<K>,
 }
 
 use std::sync::RwLock;
-struct DefaultStorage<K>(Arc<RwLock<HashMap<K, LongpollTX>>>);
+
+#[derive(Clone, Debug)]
+pub struct DefaultStorage<K>(Arc<RwLock<HashMap<K, LongpollTX>>>);
+
 impl<K> Default for DefaultStorage<K> {
     fn default() -> Self {
         Self(RwLock::new(HashMap::new()).into())
@@ -264,7 +273,7 @@ impl<K> _Longpoll<K, DefaultStorage<K>>
 where
     K: Eq + Hash,
 {
-    fn add(&self, k: K, capacity: usize) -> Result<HTTPSession, ()> {
+    fn add(&self, k: K, capacity: usize) -> Result<ReqStream, ()> {
         todo!()
     }
 
@@ -273,12 +282,37 @@ where
     }
 
     // TODO: Define Error !
-    async fn forward(&self, k: K, req: Request) -> Result<Response, ()> {
+    pub async fn forward(&self, k: K, req: Request) -> Result<Response, ()> {
+        todo!()
+    }
+
+    pub fn new<C, Fut>(self, key: K, callback: C)
+    where
+        C: FnOnce(Session) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         todo!()
     }
 }
 
-pub type HTTPLongpoll<K = String> = _Longpoll<K, DefaultStorage<K>>;
+impl<K, M, S> FromRequestParts<S> for _Longpoll<K, M>
+where
+    M: Clone + Sync + Send + 'static,
+    K: Clone + Sync + Send + 'static,
+    S: Send + Sync,
+{
+    type Rejection = ExtensionRejection;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Extension::<Self>::from_request_parts(parts, state)
+            .await
+            .map(|a| a.0)
+    }
+}
+
+pub type HTTPLongpoll<K> = _Longpoll<K, DefaultStorage<K>>;
 
 #[cfg(test)]
 mod tests {

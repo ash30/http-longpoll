@@ -7,3 +7,4 @@ edition = "2021"
 axum = "0.8.1"
 axum-longpoll = { version = "0.1.0", path = "../../axum-longpoll" }
 tokio = { version = "1.44.1", features = ["full"] }
+uuid7 = { version = "1.1.0", features = ["serde"] }
