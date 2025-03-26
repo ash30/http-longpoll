@@ -4,48 +4,20 @@
 
 use axum::body::{Body, Bytes};
 use axum::response::IntoResponse;
+use axum::Extension;
 use axum::{extract::Request, response::Response};
 use futures::{stream, Sink, Stream, StreamExt};
 use pin_project_lite::pin_project;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use tokio::sync::{mpsc, oneshot};
+use tower::{Layer, Service};
 
 type ResponseCallback = oneshot::Sender<Response>;
-
-#[derive(Debug, Clone)]
-struct HTTPSessionStore<K: Hash + Eq> {
-    ss: Arc<papaya::HashMap<K, mpsc::Sender<(Request, ResponseCallback)>>>,
-}
-
-impl<K> HTTPSessionStore<K>
-where
-    K: Hash + Eq,
-{
-    fn new() -> Self {
-        Self {
-            ss: papaya::HashMap::new().into(),
-        }
-    }
-
-    fn add(&self, k: K, capacity: usize) -> Result<HTTPSession, ()> {
-        let map = self.ss.pin();
-        let (tx, rx) = mpsc::channel(capacity);
-        Ok(HTTPSession { rx })
-    }
-
-    fn remove(&self, k: K) {
-        todo!()
-    }
-
-    // TODO: Define Error !
-    async fn forward(&self, k: K, req: Request) -> Result<Response, ()> {
-        todo!()
-    }
-}
 
 pin_project! {
     #[derive(Debug)]
@@ -249,19 +221,72 @@ where
     }
 }
 
-#[derive(Clone)]
-pub struct HTTPLongpollService<S, K: Eq + Hash> {
-    inner: S,
-    store: HTTPSessionStore<K>,
+// ==========
+
+type LongpollTX = mpsc::Sender<(Request, ResponseCallback)>;
+
+pub struct _Longpoll<K, M> {
+    store: M,
+    _key: PhantomData<K>,
 }
 
-#[derive(Clone)]
-struct EngineReqExtension<K: Eq + Hash> {
-    store: HTTPSessionStore<K>,
+use std::sync::RwLock;
+struct DefaultStorage<K>(Arc<RwLock<HashMap<K, LongpollTX>>>);
+impl<K> Default for DefaultStorage<K> {
+    fn default() -> Self {
+        Self(RwLock::new(HashMap::new()).into())
+    }
 }
+
+impl<K, M> Default for _Longpoll<K, M>
+where
+    M: Default,
+{
+    fn default() -> Self {
+        Self {
+            store: M::default(),
+            _key: PhantomData,
+        }
+    }
+}
+
+impl<K, M> _Longpoll<K, M>
+where
+    M: Default,
+    K: Eq + Hash + Send + Sync + 'static,
+{
+    pub fn new_layer() -> Extension<Self> {
+        Extension(Self::default())
+    }
+}
+
+impl<K> _Longpoll<K, DefaultStorage<K>>
+where
+    K: Eq + Hash,
+{
+    fn add(&self, k: K, capacity: usize) -> Result<HTTPSession, ()> {
+        todo!()
+    }
+
+    fn remove(&self, k: K) {
+        todo!()
+    }
+
+    // TODO: Define Error !
+    async fn forward(&self, k: K, req: Request) -> Result<Response, ()> {
+        todo!()
+    }
+}
+
+pub type HTTPLongpoll<K = String> = _Longpoll<K, DefaultStorage<K>>;
 
 #[cfg(test)]
 mod tests {
+    use crate::HTTPLongpoll;
+
     #[test]
-    fn init() {}
+    fn init() {
+        let a = HTTPLongpoll::new_layer();
+        a.add("test".to_string(), 10);
+    }
 }
