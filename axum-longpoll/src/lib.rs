@@ -262,16 +262,8 @@ struct EngineReqExtension<K: Eq + Hash> {
 
 #[cfg(test)]
 mod tests {
+    use axum::response::{IntoResponse, Response};
 
     #[test]
-    fn init() {
-        #[axum::debug_handler]
-        async fn test(e: Engine) -> Response {
-            e.on_connect(|mut socket| async move {
-                let m = socket.next().await;
-            })
-        }
-        let s = engine_io(test, ());
-        //let r: Router<()> = Router::new().route_service("/rtc", s); //.with_state(()));
-    }
+    fn init() {}
 }
