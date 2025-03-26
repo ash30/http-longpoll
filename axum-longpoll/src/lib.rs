@@ -181,7 +181,7 @@ where
 {
     type Item = W::Item;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.poll_next(cx)
+        self.project().inner.poll_next(cx)
     }
 }
 
