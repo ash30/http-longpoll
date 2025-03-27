@@ -4,11 +4,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use axum_longpoll::HTTPLongpoll;
+use axum_longpoll::{HTTPLongpoll, Session};
+use futures_util::StreamExt;
 use uuid7::{uuid7, Uuid};
 
 #[tokio::main]
 async fn main() {
+    // create routes to init and poll
     let app = Router::new()
         .route("/session", post(session_new))
         .route("/session/{id}", get(session_poll))
@@ -21,7 +23,7 @@ async fn main() {
 async fn session_new(polling: HTTPLongpoll<Uuid>) -> impl IntoResponse {
     // we choose a UUID type to act as a key for new session
     let id = uuid7();
-    polling.new(id, |s| async move {});
+    polling.new(id, |s| async move { session_handler(s).await });
     // return key to clients so they can poll using it
     Json(id)
 }
@@ -34,4 +36,8 @@ async fn session_poll(
     //  We extract the session key using dynamic path extractor
     // and forward req to existing session
     polling.forward(session_id, req).await
+}
+
+async fn session_handler(s: Session) {
+    let (tx, rx) = s.split();
 }
