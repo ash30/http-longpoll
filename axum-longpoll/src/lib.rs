@@ -5,7 +5,7 @@
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::ExtensionRejection;
 use axum::extract::FromRequestParts;
-use axum::response::IntoResponse;
+use axum::http::{Method, StatusCode};
 use axum::Extension;
 use axum::{extract::Request, response::Response};
 use futures::{stream, Future, Sink, Stream};
@@ -18,153 +18,235 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 
-type ResponseCallback = oneshot::Sender<Response>;
+type ResponseCallback<T> = oneshot::Sender<Response<T>>;
+type ForwardedReq<T> = (Request<T>, ResponseCallback<T>);
 
 pin_project! {
     #[derive(Debug)]
-    pub struct ReqStream {
-        rx: mpsc::Receiver<(Request, ResponseCallback)>,
+    pub struct ReqStream<T> {
+        rx: mpsc::Receiver<ForwardedReq<T>>,
     }
 }
 
-impl ReqStream {
-    fn is_closed(&self) -> bool {
+impl<T> ReqStream<T> {
+    pub fn is_closed(&self) -> bool {
         self.rx.is_closed()
     }
-    fn close(&mut self) {
+    pub fn close(&mut self) {
         self.rx.close()
     }
 }
 
-impl Stream for ReqStream {
-    type Item = (Request, oneshot::Sender<Response>);
+impl<T> Stream for ReqStream<T> {
+    type Item = (Request<T>, oneshot::Sender<Response<T>>);
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        this.rx.poll_recv(cx)
+        if self.is_closed() {
+            Poll::Ready(None)
+        } else {
+            self.project().rx.poll_recv(cx)
+        }
     }
 }
 
-// Out needs to be Into Response, but really, we've lost http semantics at this point
+// =======
+
+pub enum Payload<T> {
+    Poll,
+    Msg(T),
+}
+
 pin_project! {
-    pub struct HTTPPoll<Res:IntoResponse> {
+    pub struct HTTPPoll<S:Stream> {
         #[pin]
-        inner:ReqStream,
-        next:Option<ResponseCallback>,
-        rx_buf: VecDeque<Request>,
-        tx: Option<Res>,
+        inner:S,
+        next_payload: VecDeque<Payload<S::Item>>,
+        next_res:Option<S::Item>,
+        next_send: Option<Response>,
+        closed:Option<HTTPPollError>
     }
 }
 
-impl<Res> HTTPPoll<Res>
-where
-    Res: IntoResponse,
-{
-    fn poll_loop(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), axum::Error>> {
-        todo!()
-    }
+#[derive(Copy, Clone, Debug)]
+pub enum HTTPPollError {
+    RemoteClose,
+    LocalClose,
+    AlreadyClosed,
+    PollingError,
 }
 
-impl<Res> Stream for HTTPPoll<Res>
+impl<S> Stream for HTTPPoll<S>
 where
-    Res: IntoResponse,
+    S: Stream<Item = ForwardedReq<Body>>,
 {
-    type Item = Request;
+    type Item = Result<Payload<ForwardedReq<Body>>, HTTPPollError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        if self.inner.is_closed() {
-            Poll::Ready(None)
-        } else {
-            self.as_mut().poll_loop(cx);
-            let this = self.project();
-            this.rx_buf
-                .pop_front()
-                .map(Some)
-                .map(Poll::Ready)
-                .unwrap_or(Poll::Pending)
+        loop {
+            if let Some(p) = self.as_mut().project().next_payload.pop_front() {
+                return Poll::Ready(Some(Ok(p)));
+            }
+            ready!(self.as_mut().poll_inner(cx))?;
         }
     }
 }
 
-impl<Res> Sink<Res> for HTTPPoll<Res>
+impl<S> HTTPPoll<S>
 where
-    Res: IntoResponse,
+    S: Stream<Item = ForwardedReq<Body>>,
 {
-    type Error = axum::Error;
+    fn close(self: Pin<&mut Self>, err: HTTPPollError) -> HTTPPollError {
+        // close existing polling responses
+        let this = self.project();
+        if let Some((_, polling_callback)) = this.next_res.take() {
+            let _ = polling_callback.send(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+        }
+        if this.closed.is_none() {
+            this.closed.replace(err);
+        }
+        err
+    }
+
+    fn poll_inner(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), HTTPPollError>> {
+        loop {
+            if let Some(e) = self.closed {
+                return Poll::Ready(Err(e));
+            }
+
+            match ready!(self.as_mut().project().inner.poll_next(cx)) {
+                // shouldn't really get here...
+                None => break Poll::Ready(Err(HTTPPollError::AlreadyClosed)),
+
+                Some((req, res)) => match *req.method() {
+                    Method::GET => {
+                        // ERROR!
+                        if self.next_res.is_some() {
+                            // close original poll
+                            // send err to new poll
+                            let _ = res.send(
+                                Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(Body::empty())
+                                    .unwrap(),
+                            );
+                            let e = self.close(HTTPPollError::PollingError);
+                            break Poll::Ready(Err(e));
+                        } else {
+                            let this = self.project();
+                            this.next_res.replace((req, res));
+                            this.next_payload.push_back(Payload::Poll);
+                            break Poll::Ready(Ok(()));
+                        }
+                    }
+                    Method::POST => {
+                        self.as_mut()
+                            .project()
+                            .next_payload
+                            .push_back(Payload::Msg((req, res)));
+                        break Poll::Ready(Ok(()));
+                    }
+                    Method::DELETE => {
+                        let e = self.close(HTTPPollError::RemoteClose);
+                        break Poll::Ready(Err(e));
+                    }
+                    _ => {
+                        let _ = res.send(
+                            Response::builder()
+                                .status(StatusCode::METHOD_NOT_ALLOWED)
+                                .body(Body::empty())
+                                .unwrap(),
+                        );
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl Sink<Response> for HTTPPoll<ReqStream<Body>> {
+    type Error = HTTPPollError;
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.close();
-        self.poll_loop(cx)
+        ready!(self.as_mut().poll_flush(cx))?;
+        self.close(HTTPPollError::LocalClose);
+        Poll::Ready(Ok(()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         loop {
-            if self.tx.is_none() {
+            if self.next_send.is_none() {
                 return Poll::Ready(Ok(()));
             }
-            if let Some(callback) = self.next.take() {
-                if let Err(_) =
-                    callback.send(self.as_mut().project().tx.take().unwrap().into_response())
-                {
+            if let Some((_, callback)) = self.next_res.take() {
+                // In theory, only get here when not closed...
+                if let Err(_) = callback.send(self.as_mut().project().next_send.take().unwrap()) {
                     todo!()
                     //return Poll::Ready(Err(todo!()));
                 }
             } else {
-                ready!(self.as_mut().poll_loop(cx))?;
+                ready!(self.as_mut().poll_inner(cx))?;
             }
         }
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Res) -> Result<(), Self::Error> {
-        if self.tx.is_some() {
+    fn start_send(self: Pin<&mut Self>, item: Response) -> Result<(), Self::Error> {
+        if self.next_send.is_some() {
             todo!()
             // Err(todo!());
         } else {
-            self.project().tx.replace(item);
+            self.project().next_send.replace(item);
             Ok(())
         }
     }
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         loop {
-            if self.tx.is_some() {
+            if self.next_send.is_some() {
                 ready!(self.as_mut().poll_flush(cx))?;
             }
-            if self.next.is_some() {
+            if self.next_res.is_some() {
                 return Poll::Ready(Ok(()));
             }
-            ready!(self.as_mut().poll_loop(cx))?;
+            ready!(self.as_mut().poll_inner(cx))?;
         }
     }
 }
 
 pin_project! {
-    pub struct Framer<W:Sink<Response>> {
+    pub struct Framer<Si> {
         #[pin]
-        inner: W,
+        inner: Si,
         buf: VecDeque<Bytes>,
         max_size:usize
     }
 }
 
 // delegate
-impl<W> Stream for Framer<W>
+impl<Si> Stream for Framer<Si>
 where
-    W: Stream + Sink<Response>,
+    Si: Stream,
 {
-    type Item = W::Item;
+    type Item = Si::Item;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().inner.poll_next(cx)
     }
 }
 
-impl<W> Framer<W>
+impl<Si> Framer<Si>
 where
-    W: Sink<Response>,
+    Si: Sink<Response>,
 {
-    fn poll_empty(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), W::Error>> {
+    fn poll_empty(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Si::Error>> {
         loop {
             if self.buf.len() == 0 {
                 return Poll::Ready(Ok(()));
@@ -183,12 +265,8 @@ where
                 v.push(this.buf.pop_front().unwrap());
             }
 
-            if let Err(e) = this
-                .inner
-                .start_send(Response::new(Body::from_stream(stream::iter(
-                    v.into_iter().map(|a| Ok::<_, &str>(a)),
-                ))))
-            {
+            let body = Body::from_stream(stream::iter(v.into_iter().map(Ok::<_, &str>)));
+            if let Err(e) = this.inner.start_send(Response::new(body)) {
                 return Poll::Ready(Err(e));
             }
         }
@@ -206,7 +284,8 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.as_mut().poll_empty(cx);
+        ready!(self.as_mut().poll_empty(cx))?;
+        // need to flush the last one too
         self.project().inner.poll_flush(cx)
     }
 
@@ -224,11 +303,11 @@ where
     }
 }
 
-pub type Session = Framer<HTTPPoll<Response>>;
+pub type Session = Framer<HTTPPoll<ReqStream<Body>>>;
 
 // ==========
 
-type LongpollTX = mpsc::Sender<(Request, ResponseCallback)>;
+type LongPollSender = mpsc::Sender<(Request<Body>, ResponseCallback<Body>)>;
 
 #[derive(Clone, Debug)]
 pub struct _Longpoll<K, M> {
@@ -239,7 +318,7 @@ pub struct _Longpoll<K, M> {
 use std::sync::RwLock;
 
 #[derive(Clone, Debug)]
-pub struct DefaultStorage<K>(Arc<RwLock<HashMap<K, LongpollTX>>>);
+pub struct DefaultStorage<K>(Arc<RwLock<HashMap<K, LongPollSender>>>);
 
 impl<K> Default for DefaultStorage<K> {
     fn default() -> Self {
@@ -273,7 +352,7 @@ impl<K> _Longpoll<K, DefaultStorage<K>>
 where
     K: Eq + Hash,
 {
-    fn add(&self, k: K, capacity: usize) -> Result<ReqStream, ()> {
+    fn add(&self, k: K, capacity: usize) -> Result<ReqStream<Body>, ()> {
         todo!()
     }
 
