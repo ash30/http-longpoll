@@ -1,14 +1,16 @@
 #![feature(trace_macros)]
 
 //trace_macros!(true);
+pub use axum::body::Bytes;
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::rejection::ExtensionRejection;
-use axum::extract::FromRequestParts;
+use axum::extract::{self, FromRequest, FromRequestParts};
 use axum::http::{Method, StatusCode};
 use axum::Extension;
 use axum::{extract::Request, response::Response};
-use futures::{stream, Future, Sink, Stream};
+use futures::future::BoxFuture;
+use futures::{stream, Future, FutureExt, Sink, Stream};
 use pin_project_lite::pin_project;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -52,7 +54,7 @@ impl<T> Stream for ReqStream<T> {
 
 pub enum Payload<T> {
     Poll,
-    Msg(T),
+    Req(T),
 }
 
 pin_project! {
@@ -152,7 +154,7 @@ where
                         self.as_mut()
                             .project()
                             .next_payload
-                            .push_back(Payload::Msg((req, res)));
+                            .push_back(Payload::Req((req, res)));
                         break Poll::Ready(Ok(()));
                     }
                     Method::DELETE => {
@@ -303,7 +305,68 @@ where
     }
 }
 
-pub type Session = Framer<HTTPPoll<ReqStream<Body>>>;
+pin_project! {
+    pub struct Session<E:FromRequest<()> = Bytes> {
+        #[pin]
+        inner: Framer<HTTPPoll<ReqStream<Body>>>,
+        next: Option<(BoxFuture<'static,Result<E,E::Rejection>>, ResponseCallback<Body>)>,
+    }
+}
+
+// Delegate
+impl Sink<Bytes> for Session {
+    type Error = HTTPPollError;
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_close(cx)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_flush(cx)
+    }
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        self.project().inner.start_send(item)
+    }
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.project().inner.poll_ready(cx)
+    }
+}
+
+impl<E> Stream for Session<E>
+where
+    E: FromRequest<()>,
+{
+    type Item = Result<E, HTTPPollError>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        Poll::Ready(loop {
+            if let Some(p) = this.next.as_mut().map(|f| f.0.as_mut().poll(cx)) {
+                // If extractor finished
+                let e = ready!(p);
+                let (_, res) = this.next.take().unwrap();
+                let _ = res.send(
+                    Response::builder()
+                        .status(if e.is_ok() {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        })
+                        .body(Body::empty())
+                        .unwrap(),
+                );
+                if e.is_ok() {
+                    break Some(e.map_err(|_| HTTPPollError::PollingError));
+                } else {
+                    continue;
+                }
+            } else if let Some(n) = ready!(this.inner.poll_next(cx)) {
+                // get next extractor fut
+                todo!()
+            } else {
+                // inner has finished
+                break None;
+            }
+        })
+    }
+}
 
 // ==========
 
@@ -365,9 +428,10 @@ where
         todo!()
     }
 
-    pub fn new<C, Fut>(self, key: K, callback: C)
+    pub fn new<C, Fut, E>(self, key: K, callback: C)
     where
-        C: FnOnce(Session) -> Fut + Send + 'static,
+        E: extract::FromRequest<()>,
+        C: FnOnce(Session<E>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         todo!()
