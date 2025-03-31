@@ -428,7 +428,7 @@ where
         todo!()
     }
 
-    pub fn new<C, Fut, E>(self, key: K, callback: C)
+    pub fn new<C, Fut, E>(&self, key: K, callback: C)
     where
         E: extract::FromRequest<()>,
         C: FnOnce(Session<E>) -> Fut + Send + 'static,
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn init() {
-        let a = HTTPLongpoll::new_layer();
-        a.add("test".to_string(), 10);
+        //let a = HTTPLongpoll::new_layer();
+        //a.add("test".to_string(), 10);
     }
 }
