@@ -4,33 +4,28 @@
 pub use axum::body::Bytes;
 
 use axum::body::Body;
-use axum::extract::rejection::ExtensionRejection;
-use axum::extract::{self, FromRequest, FromRequestParts};
+use axum::extract::FromRequest;
 use axum::http::{Method, StatusCode};
-use axum::Extension;
 use axum::{extract::Request, response::Response};
 use futures::future::BoxFuture;
-use futures::{stream, Future, FutureExt, Sink, Stream};
+use futures::{Future, Sink, Stream};
 use pin_project_lite::pin_project;
-use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
-use std::marker::PhantomData;
+use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use tokio::sync::{mpsc, oneshot};
 
-type ResponseCallback<T> = oneshot::Sender<Response<T>>;
-type ForwardedReq<T> = (Request<T>, ResponseCallback<T>);
+type ResponseCallback<U> = oneshot::Sender<Response<U>>;
+type ForwardedReq<T, U> = (Request<T>, ResponseCallback<U>);
 
 pin_project! {
     #[derive(Debug)]
-    pub struct ReqStream<T> {
-        rx: mpsc::Receiver<ForwardedReq<T>>,
+    pub struct ReqStream<T,U> {
+        rx: mpsc::Receiver<ForwardedReq<T,U>>,
     }
 }
 
-impl<T> ReqStream<T> {
+impl<T, U> ReqStream<T, U> {
     pub fn is_closed(&self) -> bool {
         self.rx.is_closed()
     }
@@ -39,8 +34,8 @@ impl<T> ReqStream<T> {
     }
 }
 
-impl<T> Stream for ReqStream<T> {
-    type Item = (Request<T>, oneshot::Sender<Response<T>>);
+impl<T, U> Stream for ReqStream<T, U> {
+    type Item = ForwardedReq<T, U>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.is_closed() {
             Poll::Ready(None)
@@ -58,13 +53,25 @@ pub enum Payload<T> {
 }
 
 pin_project! {
-    pub struct HTTPPoll<S:Stream> {
+    pub struct HTTPPoll<T,U> {
         #[pin]
-        inner:S,
-        next_payload: VecDeque<Payload<S::Item>>,
-        next_res:Option<S::Item>,
-        next_send: Option<Response>,
+        inner:ReqStream<T,U>,
+        next_payload: VecDeque<Payload<ForwardedReq<T,U>>>,
+        next_res:Option<ForwardedReq<T,U>>,
+        next_send: Option<Response<U>>,
         closed:Option<HTTPPollError>
+    }
+}
+
+impl<T, U> HTTPPoll<T, U> {
+    fn new(s: ReqStream<T, U>) -> Self {
+        HTTPPoll {
+            inner: s,
+            next_payload: VecDeque::new(),
+            next_res: None,
+            next_send: None,
+            closed: None,
+        }
     }
 }
 
@@ -76,11 +83,11 @@ pub enum HTTPPollError {
     PollingError,
 }
 
-impl<S> Stream for HTTPPoll<S>
+impl<T, U> Stream for HTTPPoll<T, U>
 where
-    S: Stream<Item = ForwardedReq<Body>>,
+    U: From<()>,
 {
-    type Item = Result<Payload<ForwardedReq<Body>>, HTTPPollError>;
+    type Item = Result<Payload<ForwardedReq<T, U>>, HTTPPollError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -95,9 +102,9 @@ where
     }
 }
 
-impl<S> HTTPPoll<S>
+impl<T, U> HTTPPoll<T, U>
 where
-    S: Stream<Item = ForwardedReq<Body>>,
+    U: From<()>,
 {
     fn close(self: Pin<&mut Self>, err: HTTPPollError) -> HTTPPollError {
         // close existing polling responses
@@ -106,7 +113,7 @@ where
             let _ = polling_callback.send(
                 Response::builder()
                     .status(StatusCode::OK)
-                    .body(Body::empty())
+                    .body(().into())
                     .unwrap(),
             );
         }
@@ -138,7 +145,7 @@ where
                             let _ = res.send(
                                 Response::builder()
                                     .status(StatusCode::BAD_REQUEST)
-                                    .body(Body::empty())
+                                    .body(().into())
                                     .unwrap(),
                             );
                             let e = self.close(HTTPPollError::PollingError);
@@ -165,7 +172,7 @@ where
                         let _ = res.send(
                             Response::builder()
                                 .status(StatusCode::METHOD_NOT_ALLOWED)
-                                .body(Body::empty())
+                                .body(().into())
                                 .unwrap(),
                         );
                     }
@@ -175,7 +182,10 @@ where
     }
 }
 
-impl Sink<Response> for HTTPPoll<ReqStream<Body>> {
+impl<T, U> Sink<Response<U>> for HTTPPoll<T, U>
+where
+    U: From<()>,
+{
     type Error = HTTPPollError;
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -201,7 +211,7 @@ impl Sink<Response> for HTTPPoll<ReqStream<Body>> {
         }
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Response) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: Response<U>) -> Result<(), Self::Error> {
         if self.next_send.is_some() {
             todo!()
             // Err(todo!());
@@ -225,30 +235,77 @@ impl Sink<Response> for HTTPPoll<ReqStream<Body>> {
 }
 
 pin_project! {
-    pub struct Framer<Si> {
+    pub struct Framer<T,U,E> {
         #[pin]
-        inner: Si,
+        inner: HTTPPoll<T,U>,
+
+        // This should be bytes... and we should just write ito it?
         buf: VecDeque<Bytes>,
-        max_size:usize
+        max_size:usize,
+
+        next: Option<(BoxFuture<'static,Result<E,Response>>, ResponseCallback<U>)>,
     }
 }
 
-// delegate
-impl<Si> Stream for Framer<Si>
+impl<T, U, E> Framer<T, U, E> {
+    fn new(s: HTTPPoll<T, U>, max_size: usize) -> Self {
+        Framer {
+            inner: s,
+            buf: VecDeque::new(),
+            max_size,
+            next: None,
+        }
+    }
+}
+
+// The extractor logic is axum specific , can we decouple ?
+impl<T, U, E> Stream for Framer<T, U, E>
 where
-    Si: Stream,
+    U: From<()>,
+    E: FromRequest<()>,
 {
-    type Item = Si::Item;
+    type Item = Result<E, HTTPPollError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().inner.poll_next(cx)
+        let this = self.project();
+        Poll::Ready(loop {
+            if let Some(p) = this.next.as_mut().map(|f| f.0.as_mut().poll(cx)) {
+                // If extractor finished
+                let e = ready!(p);
+                let (_, res) = this.next.take().unwrap();
+                let _ = res.send(
+                    Response::builder()
+                        .status(if e.is_ok() {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        })
+                        .body(().into())
+                        .unwrap(),
+                );
+                if e.is_ok() {
+                    break Some(e.map_err(|_| HTTPPollError::PollingError));
+                } else {
+                    continue;
+                }
+            } else if let Some(n) = ready!(this.inner.poll_next(cx)) {
+                // get next extractor fut
+                todo!()
+            } else {
+                // inner has finished
+                break None;
+            }
+        })
     }
 }
 
-impl<Si> Framer<Si>
+impl<T, U, E> Framer<T, U, E>
 where
-    Si: Sink<Response>,
+    U: From<()> + From<Bytes>,
 {
-    fn poll_empty(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Si::Error>> {
+    fn poll_empty(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), HTTPPollError>> {
         loop {
             if self.buf.len() == 0 {
                 return Poll::Ready(Ok(()));
@@ -266,20 +323,22 @@ where
                 cur_size += a.len();
                 v.push(this.buf.pop_front().unwrap());
             }
-
-            let body = Body::from_stream(stream::iter(v.into_iter().map(Ok::<_, &str>)));
-            if let Err(e) = this.inner.start_send(Response::new(body)) {
-                return Poll::Ready(Err(e));
-            }
+            //let body = v.into_iter().map(|b| b.as_mut().to_vec()).flatten().co
+            //let body = Body::from_stream(stream::iter(v.into_iter().map(Ok::<_, &str>)));
+            //if let Err(e) = this.inner.start_send(Response::new(body)) {
+            //return Poll::Ready(Err(e));
+            //}
+            todo!()
         }
     }
 }
 
-impl<W> Sink<Bytes> for Framer<W>
+impl<T, U, E> Sink<Bytes> for Framer<T, U, E>
 where
-    W: Sink<Response>,
+    U: From<()> + From<Bytes>,
 {
-    type Error = W::Error;
+    type Error = HTTPPollError;
+
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
         self.project().inner.poll_close(cx)
@@ -305,161 +364,68 @@ where
     }
 }
 
-pin_project! {
-    pub struct Session<E:FromRequest<()> = Bytes> {
-        #[pin]
-        inner: Framer<HTTPPoll<ReqStream<Body>>>,
-        next: Option<(BoxFuture<'static,Result<E,E::Rejection>>, ResponseCallback<Body>)>,
-    }
-}
-
-// Delegate
-impl Sink<Bytes> for Session {
-    type Error = HTTPPollError;
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().inner.poll_close(cx)
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().inner.poll_flush(cx)
-    }
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        self.project().inner.start_send(item)
-    }
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().inner.poll_ready(cx)
-    }
-}
-
-impl<E> Stream for Session<E>
-where
-    E: FromRequest<()>,
-{
-    type Item = Result<E, HTTPPollError>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        Poll::Ready(loop {
-            if let Some(p) = this.next.as_mut().map(|f| f.0.as_mut().poll(cx)) {
-                // If extractor finished
-                let e = ready!(p);
-                let (_, res) = this.next.take().unwrap();
-                let _ = res.send(
-                    Response::builder()
-                        .status(if e.is_ok() {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::BAD_REQUEST
-                        })
-                        .body(Body::empty())
-                        .unwrap(),
-                );
-                if e.is_ok() {
-                    break Some(e.map_err(|_| HTTPPollError::PollingError));
-                } else {
-                    continue;
-                }
-            } else if let Some(n) = ready!(this.inner.poll_next(cx)) {
-                // get next extractor fut
-                todo!()
-            } else {
-                // inner has finished
-                break None;
-            }
-        })
-    }
-}
+pub type Session<Ex = Bytes, B = Body, Res = Body> = Framer<B, Res, Ex>;
 
 // ==========
 
-type LongPollSender = mpsc::Sender<(Request<Body>, ResponseCallback<Body>)>;
-
-#[derive(Clone, Debug)]
-pub struct _Longpoll<K, M> {
-    store: M,
-    _key: PhantomData<K>,
+pub struct LongPoll {
+    message_max_size: usize,
+    request_capactiy: usize,
 }
 
-use std::sync::RwLock;
-
-#[derive(Clone, Debug)]
-pub struct DefaultStorage<K>(Arc<RwLock<HashMap<K, LongPollSender>>>);
-
-impl<K> Default for DefaultStorage<K> {
-    fn default() -> Self {
-        Self(RwLock::new(HashMap::new()).into())
-    }
-}
-
-impl<K, M> Default for _Longpoll<K, M>
-where
-    M: Default,
-{
+impl Default for LongPoll {
     fn default() -> Self {
         Self {
-            store: M::default(),
-            _key: PhantomData,
+            message_max_size: 1 << 20,
+            request_capactiy: 32,
         }
     }
 }
 
-impl<K, M> _Longpoll<K, M>
-where
-    M: Default,
-    K: Eq + Hash + Send + Sync + 'static,
-{
-    pub fn new_layer() -> Extension<Self> {
-        Extension(Self::default())
-    }
-}
-
-impl<K> _Longpoll<K, DefaultStorage<K>>
-where
-    K: Eq + Hash,
-{
-    fn add(&self, k: K, capacity: usize) -> Result<ReqStream<Body>, ()> {
-        todo!()
-    }
-
-    fn remove(&self, k: K) {
-        todo!()
-    }
-
-    // TODO: Define Error !
-    pub async fn forward(&self, k: K, req: Request) -> Result<Response, ()> {
-        todo!()
-    }
-
-    pub fn new<C, Fut, E>(&self, key: K, callback: C)
+impl LongPoll {
+    pub fn connect<F, Fut, E, T, U>(&self, callback: F) -> Sender<T, U>
     where
-        E: extract::FromRequest<()>,
-        C: FnOnce(Session<E>) -> Fut + Send + 'static,
+        F: FnOnce(Session<E, T, U>) -> Fut + Send + 'static,
+        E: FromRequest<()> + Send + 'static,
+        T: Send + 'static,
+        U: Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        todo!()
+        let (tx, rx) = mpsc::channel(self.request_capactiy);
+        let s = Session::new(HTTPPoll::new(ReqStream { rx }), self.message_max_size);
+        tokio::spawn(async move { callback(s).await });
+        Sender { tx }
     }
 }
 
-impl<K, M, S> FromRequestParts<S> for _Longpoll<K, M>
-where
-    M: Clone + Sync + Send + 'static,
-    K: Clone + Sync + Send + 'static,
-    S: Send + Sync,
-{
-    type Rejection = ExtensionRejection;
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Extension::<Self>::from_request_parts(parts, state)
-            .await
-            .map(|a| a.0)
+pub struct SenderError<T>(Option<Request<T>>);
+
+impl<T, U> From<mpsc::error::SendError<ForwardedReq<T, U>>> for SenderError<T> {
+    fn from(value: mpsc::error::SendError<ForwardedReq<T, U>>) -> Self {
+        Self(Some(value.0 .0))
+    }
+}
+impl<T> From<oneshot::error::RecvError> for SenderError<T> {
+    fn from(_: oneshot::error::RecvError) -> Self {
+        Self(None)
     }
 }
 
-pub type HTTPLongpoll<K> = _Longpoll<K, DefaultStorage<K>>;
+#[derive(Clone, Debug)]
+pub struct Sender<T = Body, U = Body> {
+    tx: mpsc::Sender<ForwardedReq<T, U>>,
+}
+
+impl<T, U> Sender<T, U> {
+    pub async fn send(&mut self, item: Request<T>) -> Result<Response<U>, SenderError<T>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send((item, tx)).await?;
+        rx.await.map_err(|e| e.into())
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use crate::HTTPLongpoll;
 
     #[test]
     fn init() {
