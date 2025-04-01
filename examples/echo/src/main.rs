@@ -1,59 +1,103 @@
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    extract::{Path, Request},
-    response::IntoResponse,
+    extract::{Path, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use axum_longpoll::{Bytes, HTTPLongpoll, Session};
+use axum_longpoll::{LongPoll, Sender, Session};
 use futures_util::{SinkExt, StreamExt};
-use tokio::{pin, time::Instant};
+use std::sync::RwLock;
 use uuid7::{uuid7, Uuid};
+
+// Client code is responsible for holding state of long poll tasks
+// and directing future request to correct key.
+#[derive(Clone, Debug)]
+struct LongPollState {
+    sessions: Arc<RwLock<HashMap<Uuid, Sender>>>,
+}
+impl LongPollState {
+    fn new() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()).into(),
+        }
+    }
+}
+
+enum Error {
+    SessionNotFound,
+    SessionError,
+}
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        Response::builder()
+            .status(match self {
+                Error::SessionNotFound => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            })
+            .body(().into())
+            .unwrap()
+    }
+}
 
 #[tokio::main]
 async fn main() {
-    // create routes to init and poll
+    // create routes to init and poll longpoll connections
     let app = Router::new()
         .route("/session", post(session_new))
         .route("/session/{id}", get(session_poll))
-        .layer(HTTPLongpoll::<Uuid>::new_layer());
+        .with_state(LongPollState::new());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn session_new(polling: HTTPLongpoll<Uuid>) -> impl IntoResponse {
-    // we choose a UUID type to act as a key for new session
+// setup longpoll task with default settings and store sender for future use
+async fn session_new(State(state): State<LongPollState>) -> impl IntoResponse {
+    // key for sender lookup later
     let id = uuid7();
-    polling.new(id, |s| async move { session_handler(s).await });
-    // return key to clients so they can poll using it
+    // client code should clean up sender on task complete
+    let cleanup = (id, state.clone());
+
+    let sender = LongPoll::default().connect(move |s| async move {
+        session_handler(s).await;
+        cleanup.1.sessions.write().unwrap().remove(&cleanup.0);
+    });
+    state.sessions.write().unwrap().insert(id, sender);
     Json(id)
 }
 
+// use stored sender to forward request
 async fn session_poll(
-    polling: HTTPLongpoll<Uuid>,
+    State(state): State<LongPollState>,
     Path(session_id): Path<Uuid>,
     req: Request,
-) -> impl IntoResponse {
-    //  We extract the session key using dynamic path extractor
-    // and forward req to existing session
-    polling.forward(session_id, req).await
+) -> Result<Response, Error> {
+    let mut session = state
+        .sessions
+        .read()
+        .unwrap()
+        .get(&session_id)
+        .cloned()
+        .ok_or(Error::SessionNotFound)?;
+
+    // Session errors are fatal, client code should clean up and
+    // inform client to init newconnection
+    session.send(req).await.map_err(|_| Error::SessionError)
 }
 
-// Example 1
+// Longpoll task allows consuming code to treat the disparate http requests
+// as a continuous stream of messages
 async fn session_handler(s: Session) {
     let (mut tx, mut rx) = s.split();
-    let client_timeout = tokio::time::sleep(Duration::from_secs(60));
-    pin!(client_timeout);
-
     loop {
         tokio::select! {
-            _ = &mut client_timeout => break,
-
             Some(m) = rx.next() => {
-                client_timeout.as_mut().reset(Instant::now() + Duration::from_secs(60));
                 match m {
+                    // task will be informed why connection closed
                     Err(reason) => {
                         break
                     }
@@ -69,6 +113,4 @@ async fn session_handler(s: Session) {
             }
         }
     }
-    // returning from the task will cleanup internal storage,
-    // if spawning off tasks, you'll need to await them
 }

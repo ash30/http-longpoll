@@ -256,18 +256,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "example_serde"
-version = "0.1.0"
-dependencies = [
- "axum",
- "axum-longpoll",
- "futures-util",
- "serde",
- "tokio",
- "uuid7",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -411,9 +411,17 @@ impl<T> From<oneshot::error::RecvError> for SenderError<T> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Sender<T = Body, U = Body> {
     tx: mpsc::Sender<ForwardedReq<T, U>>,
+}
+
+impl<T, U> Clone for Sender<T, U> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 impl<T, U> Sender<T, U> {
