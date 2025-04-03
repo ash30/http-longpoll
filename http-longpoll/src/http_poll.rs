@@ -51,7 +51,7 @@ pub enum Payload<T> {
 }
 
 pin_project! {
-    pub struct HTTPPoll<T,U> {
+    pub struct PollReqStream<T,U> {
         #[pin]
         inner:ReqStream<T,U>,
         next_payload: VecDeque<Payload<ForwardedReq<T,U>>>,
@@ -61,9 +61,9 @@ pin_project! {
     }
 }
 
-impl<T, U> HTTPPoll<T, U> {
+impl<T, U> PollReqStream<T, U> {
     pub fn new(s: ReqStream<T, U>) -> Self {
-        HTTPPoll {
+        PollReqStream {
             inner: s,
             next_payload: VecDeque::new(),
             next_res: None,
@@ -81,7 +81,7 @@ pub enum HTTPPollError {
     PollingError,
 }
 
-impl<T, U> Stream for HTTPPoll<T, U>
+impl<T, U> Stream for PollReqStream<T, U>
 where
     U: From<()>,
 {
@@ -100,7 +100,7 @@ where
     }
 }
 
-impl<T, U> HTTPPoll<T, U>
+impl<T, U> PollReqStream<T, U>
 where
     U: From<()>,
 {
@@ -180,7 +180,7 @@ where
     }
 }
 
-impl<T, U> Sink<Response<U>> for HTTPPoll<T, U>
+impl<T, U> Sink<Response<U>> for PollReqStream<T, U>
 where
     U: From<()>,
 {

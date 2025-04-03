@@ -11,19 +11,19 @@ use axum::{extract::Request, response::Response};
 use futures::Future;
 use tokio::sync::{mpsc, oneshot};
 
-use http_poll::{ForwardedReq, HTTPPoll, ReqStream};
+use http_poll::{ForwardedReq, PollReqStream, ReqStream};
 use session::{FromPollRequest, IntoPollResponse};
 
 pub use session::Session;
 
 // API
 
-pub struct LongPoll {
+pub struct HTTPLongPoll {
     message_max_size: usize,
     request_capactiy: usize,
 }
 
-impl Default for LongPoll {
+impl Default for HTTPLongPoll {
     fn default() -> Self {
         Self {
             message_max_size: 1 << 20,
@@ -32,7 +32,7 @@ impl Default for LongPoll {
     }
 }
 
-impl LongPoll {
+impl HTTPLongPoll {
     pub fn connect<F, Fut, E, T, U>(&self, callback: F) -> Sender<T, U>
     where
         F: FnOnce(Session<E, T, U>) -> Fut + Send + 'static,
@@ -42,7 +42,10 @@ impl LongPoll {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let (tx, rx) = mpsc::channel(self.request_capactiy);
-        let s = Session::new(HTTPPoll::new(ReqStream::new(rx)), self.message_max_size);
+        let s = Session::new(
+            PollReqStream::new(ReqStream::new(rx)),
+            self.message_max_size,
+        );
         tokio::spawn(async move { callback(s).await });
         Sender { tx }
     }

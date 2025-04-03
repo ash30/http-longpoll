@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use axum_longpoll::{LongPoll, Sender, Session};
+use axum_longpoll::{HTTPLongPoll, Sender, Session};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::RwLock;
 use uuid7::{uuid7, Uuid};
@@ -62,7 +62,7 @@ async fn session_new(State(state): State<LongPollState>) -> impl IntoResponse {
     // client code should clean up sender on task complete
     let cleanup = (id, state.clone());
 
-    let sender = LongPoll::default().connect(move |s| async move {
+    let sender = HTTPLongPoll::default().connect(move |s| async move {
         session_handler(s).await;
         cleanup.1.sessions.write().unwrap().remove(&cleanup.0);
     });

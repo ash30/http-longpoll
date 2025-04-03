@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use crate::http_poll::{HTTPPoll, HTTPPollError, ResponseCallback};
+use crate::http_poll::{HTTPPollError, PollReqStream, ResponseCallback};
 use crate::Bytes;
 
 pub trait FromPollRequest<T>: Sized {
@@ -35,7 +35,7 @@ pub trait IntoPollResponse<U>: Sized {
 pin_project! {
     pub struct Session<E:IntoPollResponse<U>,T,U> {
         #[pin]
-        inner: HTTPPoll<T,U>,
+        inner: PollReqStream<T,U>,
         next: Option<(BoxFuture<'static,Result<E,Response<U>>>, ResponseCallback<U>)>,
         buf: VecDeque<E::Buffered>,
         max_size:usize,
@@ -46,7 +46,7 @@ impl<T, U, E> Session<E, T, U>
 where
     E: IntoPollResponse<U>,
 {
-    pub fn new(s: HTTPPoll<T, U>, max_size: usize) -> Self {
+    pub fn new(s: PollReqStream<T, U>, max_size: usize) -> Self {
         let mut buf = VecDeque::default();
         buf.make_contiguous();
         Session {
