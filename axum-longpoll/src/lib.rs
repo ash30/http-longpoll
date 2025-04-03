@@ -6,11 +6,18 @@ pub use axum::body::Bytes;
 use axum::body::Body;
 use axum::extract::FromRequest;
 use axum::http::{Method, StatusCode};
+use axum::response::{ErrorResponse, IntoResponse};
+use axum::Json;
 use axum::{extract::Request, response::Response};
+use bytes::buf::Limit;
+use bytes::{Buf, BufMut, BytesMut};
 use futures::future::BoxFuture;
-use futures::{Future, Sink, Stream};
+use futures::{Future, Sink, Stream, TryFutureExt};
 use pin_project_lite::pin_project;
+use serde::Serialize;
+use serde_json::value::RawValue;
 use std::collections::VecDeque;
+use std::default;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use tokio::sync::{mpsc, oneshot};
@@ -235,34 +242,85 @@ where
 }
 
 pin_project! {
-    pub struct Framer<T,U,E> {
+    pub struct Framer<T,U,E:IntoPollResponse<U>> {
         #[pin]
         inner: HTTPPoll<T,U>,
 
         // This should be bytes... and we should just write ito it?
-        buf: VecDeque<Bytes>,
+        buf: VecDeque<E::Buffered>,
         max_size:usize,
 
-        next: Option<(BoxFuture<'static,Result<E,Response>>, ResponseCallback<U>)>,
+        next: Option<(BoxFuture<'static,Result<E,Response<U>>>, ResponseCallback<U>)>,
     }
 }
 
-impl<T, U, E> Framer<T, U, E> {
+impl<T, U, E> Framer<T, U, E>
+where
+    E: IntoPollResponse<U>,
+{
     fn new(s: HTTPPoll<T, U>, max_size: usize) -> Self {
+        let mut buf = VecDeque::default();
+        buf.make_contiguous();
         Framer {
             inner: s,
-            buf: VecDeque::new(),
-            max_size,
             next: None,
+            buf,
+            max_size,
         }
     }
 }
 
-// The extractor logic is axum specific , can we decouple ?
+pub trait FromPollRequest<T>: Sized {
+    fn from_poll_req(req: Request<T>) -> impl Future<Output = Result<Self, Response>> + Send;
+}
+
+pub trait Len {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub trait IntoPollResponse<U>: Sized {
+    type Buffered: TryFrom<Self> + Len + Send;
+    fn into_poll_response(buf: Vec<Self::Buffered>) -> Response<U>;
+}
+
+/// ======
+// Axum
+impl<T> FromPollRequest<Body> for T
+where
+    T: FromRequest<()>,
+{
+    fn from_poll_req(req: Request) -> impl Future<Output = Result<Self, Response>> + Send {
+        T::from_request(req, &()).map_err(|e| e.into_response())
+    }
+}
+
+impl Len for Bytes {
+    fn len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<U> IntoPollResponse<U> for Bytes
+where
+    U: From<Bytes>,
+{
+    type Buffered = Self;
+    fn into_poll_response(buf: Vec<Self::Buffered>) -> Response<U> {
+        let mut out = BytesMut::new();
+        for b in buf {
+            out.extend_from_slice(&b);
+        }
+        Response::new(U::from(out.freeze()))
+    }
+}
+
 impl<T, U, E> Stream for Framer<T, U, E>
 where
     U: From<()>,
-    E: FromRequest<()>,
+    E: FromPollRequest<T> + IntoPollResponse<U>,
 {
     type Item = Result<E, HTTPPollError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -300,64 +358,80 @@ where
 
 impl<T, U, E> Framer<T, U, E>
 where
-    U: From<()> + From<Bytes>,
+    U: From<()>,
+    E: IntoPollResponse<U>,
 {
     fn poll_empty(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), HTTPPollError>> {
         loop {
-            if self.buf.len() == 0 {
+            if self.buf.is_empty() {
                 return Poll::Ready(Ok(()));
             }
             ready!(self.as_mut().project().inner.poll_ready(cx))?;
             let this = self.as_mut().project();
-
             let mut v = vec![];
-            let mut cur_size = 0;
+            let mut n = 0;
             loop {
-                let Some(a) = this.buf.front() else { break };
-                if cur_size + a.len() > *this.max_size {
+                let Some(b) = this.buf.front() else { break };
+                if n + b.len() > *this.max_size {
                     break;
-                };
-                cur_size += a.len();
+                }
+                n += b.len();
                 v.push(this.buf.pop_front().unwrap());
             }
-            //let body = v.into_iter().map(|b| b.as_mut().to_vec()).flatten().co
-            //let body = Body::from_stream(stream::iter(v.into_iter().map(Ok::<_, &str>)));
-            //if let Err(e) = this.inner.start_send(Response::new(body)) {
-            //return Poll::Ready(Err(e));
-            //}
-            todo!()
+            let res = E::into_poll_response(v);
+            if let Err(e) = this.inner.start_send(res) {
+                return Poll::Ready(Err(e));
+            };
         }
     }
 }
 
-impl<T, U, E> Sink<Bytes> for Framer<T, U, E>
+pub enum FrameError<E> {
+    Send(E),
+    SendLimit,
+    Polling(HTTPPollError),
+}
+
+impl<E> From<HTTPPollError> for FrameError<E> {
+    fn from(value: HTTPPollError) -> Self {
+        FrameError::Polling(value)
+    }
+}
+
+impl<T, U, E> Sink<E> for Framer<T, U, E>
 where
-    U: From<()> + From<Bytes>,
+    U: From<()>,
+    E: IntoPollResponse<U>,
 {
-    type Error = HTTPPollError;
+    type Error = FrameError<<E::Buffered as TryFrom<E>>::Error>;
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        self.project().inner.poll_close(cx)
+        self.project().inner.poll_close(cx).map_err(|e| e.into())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_empty(cx))?;
         // need to flush the last one too
-        self.project().inner.poll_flush(cx)
+        self.project().inner.poll_flush(cx).map_err(|e| e.into())
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        self.project().buf.push_back(item);
-        Ok(())
+    fn start_send(self: Pin<&mut Self>, item: E) -> Result<(), Self::Error> {
+        let n: E::Buffered = item.try_into().map_err(FrameError::Send)?;
+        if n.len() > self.max_size {
+            Err(FrameError::SendLimit)
+        } else {
+            self.project().buf.push_back(n);
+            Ok(())
+        }
     }
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if self.buf.len() > self.max_size {
-            self.poll_empty(cx)
+            self.poll_empty(cx).map_err(|e| e.into())
         } else {
             Poll::Ready(Ok(()))
         }
@@ -386,7 +460,7 @@ impl LongPoll {
     pub fn connect<F, Fut, E, T, U>(&self, callback: F) -> Sender<T, U>
     where
         F: FnOnce(Session<E, T, U>) -> Fut + Send + 'static,
-        E: FromRequest<()> + Send + 'static,
+        E: IntoPollResponse<U> + FromPollRequest<T> + Send + 'static,
         T: Send + 'static,
         U: Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,

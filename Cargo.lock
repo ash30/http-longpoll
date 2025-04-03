@@ -130,6 +130,7 @@ dependencies = [
  "papaya",
  "pin-project-lite",
  "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tower-http",
