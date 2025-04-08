@@ -1,3 +1,3 @@
 [workspace]
-members = [ "axum-eio","axum-longpoll", "examples/*"]
+members = [ "axum-eio","http-longpoll","examples/*"]
 resolver = "2"

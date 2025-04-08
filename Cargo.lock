@@ -117,29 +117,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum-longpoll"
-version = "0.1.0"
-dependencies = [
- "axum",
- "axum-extra",
- "bytes",
- "futures",
- "futures-util",
- "headers",
- "http-body-util",
- "papaya",
- "pin-project-lite",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid7",
-]
-
-[[package]]
 name = "axum-macros"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -250,8 +227,8 @@ name = "example_echo"
 version = "0.1.0"
 dependencies = [
  "axum",
- "axum-longpoll",
  "futures-util",
+ "http-longpoll",
  "tokio",
  "uuid7",
 ]
@@ -461,6 +438,29 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http-longpoll"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-extra",
+ "bytes",
+ "futures",
+ "futures-util",
+ "headers",
+ "http-body-util",
+ "papaya",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid7",
 ]
 
 [[package]]
