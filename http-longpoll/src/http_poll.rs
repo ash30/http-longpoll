@@ -4,7 +4,7 @@ use futures::{Sink, Stream};
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{ready, Context, Poll, Waker};
 use tokio::sync::{mpsc, oneshot};
 
 pub type ResponseCallback<U> = oneshot::Sender<Response<U>>;
@@ -57,18 +57,20 @@ pin_project! {
         next_payload: VecDeque<Payload<ForwardedReq<T,U>>>,
         next_res:Option<ForwardedReq<T,U>>,
         next_send: Option<Response<U>>,
-        closed:Option<HTTPPollError>
+        closed:Option<HTTPPollError>,
+        multi_waker: MultiTaskWaker,
     }
 }
 
 impl<T, U> PollReqStream<T, U> {
     pub fn new(s: ReqStream<T, U>) -> Self {
-        PollReqStream {
+        Self {
             inner: s,
             next_payload: VecDeque::new(),
             next_res: None,
             next_send: None,
             closed: None,
+            multi_waker: MultiTaskWaker::new(),
         }
     }
 }
@@ -95,7 +97,7 @@ where
             if let Some(p) = self.as_mut().project().next_payload.pop_front() {
                 return Poll::Ready(Some(Ok(p)));
             }
-            ready!(self.as_mut().poll_inner(cx))?;
+            ready!(self.as_mut().poll_inner_read(cx))?;
         }
     }
 }
@@ -121,7 +123,23 @@ where
         err
     }
 
-    fn poll_inner(
+    fn poll_inner_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), HTTPPollError>> {
+        let w = self.multi_waker.set_read_waker(cx.waker()).as_waker();
+        self.__poll_inner(&mut Context::from_waker(&w))
+    }
+
+    fn poll_inner_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), HTTPPollError>> {
+        let w = self.multi_waker.set_write_waker(cx.waker()).as_waker();
+        self.__poll_inner(&mut Context::from_waker(&w))
+    }
+
+    fn __poll_inner(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), HTTPPollError>> {
@@ -129,7 +147,6 @@ where
             if let Some(e) = self.closed {
                 return Poll::Ready(Err(e));
             }
-
             match ready!(self.as_mut().project().inner.poll_next(cx)) {
                 // shouldn't really get here...
                 None => break Poll::Ready(Err(HTTPPollError::AlreadyClosed)),
@@ -204,7 +221,7 @@ where
                     //return Poll::Ready(Err(todo!()));
                 }
             } else {
-                ready!(self.as_mut().poll_inner(cx))?;
+                ready!(self.as_mut().poll_inner_write(cx))?;
             }
         }
     }
@@ -227,7 +244,50 @@ where
             if self.next_res.is_some() {
                 return Poll::Ready(Ok(()));
             }
-            ready!(self.as_mut().poll_inner(cx))?;
+            ready!(self.as_mut().poll_inner_write(cx))?;
         }
+    }
+}
+
+// =====
+
+use futures::task::AtomicWaker;
+use std::sync::Arc;
+use std::task::Wake;
+struct MultiTaskWaker(Arc<Inner>);
+struct Inner {
+    r: AtomicWaker,
+    w: AtomicWaker,
+}
+
+impl MultiTaskWaker {
+    pub fn new() -> Self {
+        MultiTaskWaker(
+            Inner {
+                r: AtomicWaker::new(),
+                w: AtomicWaker::new(),
+            }
+            .into(),
+        )
+    }
+
+    fn set_read_waker(&mut self, w: &Waker) -> &mut Self {
+        self.0.r.register(w);
+        self
+    }
+    fn set_write_waker(&mut self, w: &Waker) -> &mut Self {
+        self.0.w.register(w);
+        self
+    }
+
+    fn as_waker(&self) -> Waker {
+        Waker::from(self.0.clone())
+    }
+}
+
+impl Wake for Inner {
+    fn wake(self: Arc<Self>) {
+        self.r.wake();
+        self.w.wake();
     }
 }
