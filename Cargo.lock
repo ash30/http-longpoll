@@ -450,6 +450,7 @@ dependencies = [
  "futures",
  "futures-util",
  "headers",
+ "http",
  "http-body-util",
  "papaya",
  "pin-project-lite",

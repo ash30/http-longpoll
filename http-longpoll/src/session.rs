@@ -3,7 +3,6 @@ use axum::extract::FromRequest;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::Request, response::Response};
-use bytes::BytesMut;
 use futures::future::BoxFuture;
 use futures::{Future, Sink, Stream, TryFutureExt};
 use pin_project_lite::pin_project;
@@ -12,7 +11,6 @@ use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
 use crate::http_poll::{HTTPPollError, PollReqStream, ResponseCallback};
-use crate::Bytes;
 
 pub trait FromPollRequest<T>: Sized {
     fn from_poll_req(req: Request<T>) -> impl Future<Output = Result<Self, Response>> + Send;
@@ -64,26 +62,6 @@ where
 {
     fn from_poll_req(req: Request) -> impl Future<Output = Result<Self, Response>> + Send {
         T::from_request(req, &()).map_err(|e| e.into_response())
-    }
-}
-
-impl Len for Bytes {
-    fn len(&self) -> usize {
-        self.len()
-    }
-}
-
-impl<U> IntoPollResponse<U> for Bytes
-where
-    U: From<Bytes>,
-{
-    type Buffered = Self;
-    fn into_poll_response(buf: Vec<Self::Buffered>) -> Response<U> {
-        let mut out = BytesMut::new();
-        for b in buf {
-            out.extend_from_slice(&b);
-        }
-        Response::new(U::from(out.freeze()))
     }
 }
 

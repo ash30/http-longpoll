@@ -1,29 +1,15 @@
-use axum::{
-    body::Body,
-    extract::{Path, Request},
-};
-use axum_longpoll::{self, HTTPLongpoll, Session};
+use axum::http::Request;
 use bytes::Bytes;
-use futures::{Future, StreamExt};
-use tokio::sync::oneshot;
-
-static SESSION_ID: &str = "sid";
+use futures::StreamExt;
+use http_longpoll::axum::HTTPLongPoll;
+use http_longpoll::Config;
 
 #[tokio::test]
-async fn forward_simple_request() {
-    let lp = HTTPLongpoll::default();
-    let (tx, rx) = oneshot::channel();
+async fn forward_test() {
+    let c = Config::default();
+    let (mut sender, mut ses) = HTTPLongPoll::<Bytes>::connect(&c);
 
-    lp.new(SESSION_ID.to_string(), |mut s: Session<Bytes>| async move {
-        s.next().await;
-        let _ = tx.send(1);
-    });
-
-    let _ = lp
-        .forward(SESSION_ID.to_string(), Request::new(Body::empty()))
-        .await;
-    let r = rx
-        .await
-        .expect("The handler received the forwarded message");
-    assert_eq!(1, r);
+    let req = Request::new(Bytes::new().into());
+    let b = ses.next().await.expect("").expect("");
+    sender.send(req).await;
 }
