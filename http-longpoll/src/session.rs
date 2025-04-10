@@ -4,13 +4,13 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::Request, response::Response};
 use futures::future::BoxFuture;
-use futures::{Future, Sink, Stream, TryFutureExt};
+use futures::{Future, FutureExt, Sink, Stream, TryFutureExt};
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use crate::http_poll::{HTTPPollError, PollReqStream, ResponseCallback};
+use crate::http_poll::{HTTPPollError, Payload, PollReqStream, ResponseCallback};
 
 pub trait FromPollRequest<T>: Sized {
     fn from_poll_req(req: Request<T>) -> impl Future<Output = Result<Self, Response>> + Send;
@@ -95,7 +95,21 @@ where
                 }
             } else if let Some(n) = ready!(this.inner.poll_next(cx)) {
                 // get next extractor fut
-                todo!()
+                match n {
+                    Err(e) => Err(e),
+                    // For now ignore poll requests,
+                    // in future, would like to use them within heartbeats
+                    Ok(Payload::Poll) => continue,
+                    Ok(Payload::Req((req, res))) => {
+                        let _ = this.next.replace((
+                            E::from_poll_req(req)
+                                .map_err(|e| HTTPPollError::PollingError)
+                                .boxed(),
+                            res,
+                        ));
+                        continue;
+                    }
+                }
             } else {
                 // inner has finished
                 break None;

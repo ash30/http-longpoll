@@ -127,8 +127,8 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), HTTPPollError>> {
-        let w = self.multi_waker.set_read_waker(cx.waker()).as_waker();
-        self.__poll_inner(&mut Context::from_waker(&w))
+        //let w = self.multi_waker.set_read_waker(cx.waker()).as_waker();
+        self.__poll_inner(cx)
     }
 
     fn poll_inner_write(

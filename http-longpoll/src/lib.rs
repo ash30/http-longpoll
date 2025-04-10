@@ -3,6 +3,8 @@
 mod http_poll;
 mod session;
 
+use std::sync::mpsc::TrySendError;
+
 use http::{Request, Response};
 use tokio::sync::{mpsc, oneshot};
 
@@ -74,16 +76,22 @@ where
     }
 }
 
-pub struct SenderError<T>(Option<Request<T>>);
-
-impl<T, U> From<mpsc::error::SendError<ForwardedReq<T, U>>> for SenderError<T> {
-    fn from(value: mpsc::error::SendError<ForwardedReq<T, U>>) -> Self {
-        Self(Some(value.0 .0))
+#[derive(Debug)]
+pub enum SenderError<T> {
+    Full(T),
+    Closed(Option<T>),
+}
+impl<T, U> From<mpsc::error::TrySendError<ForwardedReq<T, U>>> for SenderError<Request<T>> {
+    fn from(value: mpsc::error::TrySendError<ForwardedReq<T, U>>) -> Self {
+        match value {
+            mpsc::error::TrySendError::Closed(v) => Self::Closed(Some(v.0)),
+            mpsc::error::TrySendError::Full(v) => Self::Full(v.0),
+        }
     }
 }
-impl<T> From<oneshot::error::RecvError> for SenderError<T> {
+impl<T> From<oneshot::error::RecvError> for SenderError<Request<T>> {
     fn from(_: oneshot::error::RecvError) -> Self {
-        Self(None)
+        Self::Closed(None)
     }
 }
 
@@ -101,9 +109,9 @@ impl<T, U> Clone for Sender<T, U> {
 }
 
 impl<T, U> Sender<T, U> {
-    pub async fn send(&mut self, item: Request<T>) -> Result<Response<U>, SenderError<T>> {
+    pub async fn send(&mut self, item: Request<T>) -> Result<Response<U>, SenderError<Request<T>>> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send((item, tx)).await?;
+        self.tx.try_send((item, tx))?;
         rx.await.map_err(|e| e.into())
     }
 }
