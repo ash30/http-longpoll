@@ -51,9 +51,11 @@ pub enum Payload<T> {
 }
 
 pin_project! {
-    pub struct PollReqStream<T,U> {
+    pub struct PollReqStream<S,T,U> where S:Stream<Item = ForwardedReq<T,U>> {
         #[pin]
-        inner:ReqStream<T,U>,
+        msg_req_stream:S,
+        #[pin]
+        poll_req_stream:S,
         next_payload: VecDeque<Payload<ForwardedReq<T,U>>>,
         next_res:Option<ForwardedReq<T,U>>,
         next_send: Option<Response<U>>,
@@ -62,10 +64,14 @@ pin_project! {
     }
 }
 
-impl<T, U> PollReqStream<T, U> {
-    pub fn new(s: ReqStream<T, U>) -> Self {
+impl<S, T, U> PollReqStream<S, T, U>
+where
+    S: Stream<Item = ForwardedReq<T, U>>,
+{
+    pub fn new(msg: S, poll: S) -> Self {
         Self {
-            inner: s,
+            msg_req_stream: msg,
+            poll_req_stream: poll,
             next_payload: VecDeque::new(),
             next_res: None,
             next_send: None,
@@ -83,8 +89,9 @@ pub enum HTTPPollError {
     PollingError,
 }
 
-impl<T, U> Stream for PollReqStream<T, U>
+impl<S, T, U> Stream for PollReqStream<S, T, U>
 where
+    S: Stream<Item = ForwardedReq<T, U>>,
     U: From<()>,
 {
     type Item = Result<Payload<ForwardedReq<T, U>>, HTTPPollError>;
@@ -97,13 +104,24 @@ where
             if let Some(p) = self.as_mut().project().next_payload.pop_front() {
                 return Poll::Ready(Some(Ok(p)));
             }
-            ready!(self.as_mut().poll_inner_read(cx))?;
+            ready!(self.as_mut().poll_inner(cx))?;
         }
     }
 }
 
-impl<T, U> PollReqStream<T, U>
+fn ready_or<F, T>(p: Poll<T>, f: F) -> Poll<T>
 where
+    F: FnOnce() -> Poll<T>,
+{
+    match p {
+        Poll::Ready(t) => Poll::Ready(t),
+        _ => f(),
+    }
+}
+
+impl<S, T, U> PollReqStream<S, T, U>
+where
+    S: Stream<Item = ForwardedReq<T, U>>,
     U: From<()>,
 {
     fn close(self: Pin<&mut Self>, err: HTTPPollError) -> HTTPPollError {
@@ -123,82 +141,54 @@ where
         err
     }
 
-    fn poll_inner_read(
+    fn poll_inner(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), HTTPPollError>> {
-        //let w = self.multi_waker.set_read_waker(cx.waker()).as_waker();
-        self.__poll_inner(cx)
-    }
+        let this = self.as_mut().project();
+        let p = this
+            .poll_req_stream
+            .poll_next(cx)
+            .map(|op| op.map(|req| (Payload::Poll, Some(req))));
 
-    fn poll_inner_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), HTTPPollError>> {
-        let w = self.multi_waker.set_write_waker(cx.waker()).as_waker();
-        self.__poll_inner(&mut Context::from_waker(&w))
-    }
+        let p = ready_or(p, || {
+            this.msg_req_stream
+                .poll_next(cx)
+                .map(|op| op.map(|req| (Payload::Req(req), None)))
+        });
 
-    fn __poll_inner(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), HTTPPollError>> {
-        loop {
-            if let Some(e) = self.closed {
-                return Poll::Ready(Err(e));
+        match ready!(p) {
+            None => {
+                self.close(HTTPPollError::RemoteClose);
             }
-            match ready!(self.as_mut().project().inner.poll_next(cx)) {
-                // shouldn't really get here...
-                None => break Poll::Ready(Err(HTTPPollError::AlreadyClosed)),
-
-                Some((req, res)) => match *req.method() {
-                    Method::GET => {
-                        // ERROR!
-                        if self.next_res.is_some() {
-                            // close original poll
-                            // send err to new poll
-                            let _ = res.send(
-                                Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(().into())
-                                    .unwrap(),
-                            );
-                            let e = self.close(HTTPPollError::PollingError);
-                            break Poll::Ready(Err(e));
-                        } else {
-                            let this = self.project();
-                            this.next_res.replace((req, res));
-                            this.next_payload.push_back(Payload::Poll);
-                            break Poll::Ready(Ok(()));
-                        }
-                    }
-                    Method::POST => {
-                        self.as_mut()
-                            .project()
-                            .next_payload
-                            .push_back(Payload::Req((req, res)));
-                        break Poll::Ready(Ok(()));
-                    }
-                    Method::DELETE => {
-                        let e = self.close(HTTPPollError::RemoteClose);
-                        break Poll::Ready(Err(e));
-                    }
-                    _ => {
-                        let _ = res.send(
-                            Response::builder()
-                                .status(StatusCode::METHOD_NOT_ALLOWED)
-                                .body(().into())
-                                .unwrap(),
-                        );
-                    }
-                },
+            Some((Payload::Poll, p)) => {
+                let (req, res) = p.unwrap();
+                if this.next_res.is_some() {
+                    // Error for non sequential poll
+                    let _ = res.send(
+                        Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(().into())
+                            .unwrap(),
+                    );
+                    let e = self.close(HTTPPollError::PollingError);
+                    return Poll::Ready(Err(e));
+                } else {
+                    this.next_res.replace((req, res));
+                    this.next_payload.push_back(Payload::Poll);
+                }
+            }
+            Some((Payload::Req((req, res)), _)) => {
+                this.next_payload.push_back(Payload::Req((req, res)));
             }
         }
+        Poll::Ready(Ok(()))
     }
 }
 
-impl<T, U> Sink<Response<U>> for PollReqStream<T, U>
+impl<S, T, U> Sink<Response<U>> for PollReqStream<S, T, U>
 where
+    S: Stream<Item = ForwardedReq<T, U>>,
     U: From<()>,
 {
     type Error = HTTPPollError;
@@ -221,7 +211,7 @@ where
                     //return Poll::Ready(Err(todo!()));
                 }
             } else {
-                ready!(self.as_mut().poll_inner_write(cx))?;
+                ready!(self.as_mut().poll_inner(cx))?;
             }
         }
     }
@@ -244,7 +234,7 @@ where
             if self.next_res.is_some() {
                 return Poll::Ready(Ok(()));
             }
-            ready!(self.as_mut().poll_inner_write(cx))?;
+            ready!(self.as_mut().poll_inner(cx))?;
         }
     }
 }

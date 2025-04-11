@@ -67,12 +67,13 @@ where
     E: IntoPollResponse<U> + FromPollRequest<T> + Send + 'static,
 {
     pub fn connect(config: &Config) -> (Sender<T, U>, Session<E, T, U>) {
-        let (tx, rx) = mpsc::channel(config.request_capactiy);
+        let (p_tx, p_rx) = mpsc::channel(config.request_capactiy);
+        let (m_tx, m_rx) = mpsc::channel(config.request_capactiy);
         let s = Session::new(
-            PollReqStream::new(ReqStream::new(rx)),
+            PollReqStream::new(ReqStream::new(p_rx)),
             config.message_max_size,
         );
-        (Sender { tx }, s)
+        (Sender { tx: p_tx }, s)
     }
 }
 
