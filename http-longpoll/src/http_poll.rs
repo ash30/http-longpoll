@@ -89,6 +89,8 @@ pub enum HTTPPollError {
     PollingError,
 }
 
+pub type PollStreamItem<T, U> = Result<Payload<ForwardedReq<T, U>>, HTTPPollError>;
+
 impl<S, T, U> Stream for PollReqStream<S, T, U>
 where
     S: Stream<Item = ForwardedReq<T, U>>,
@@ -204,7 +206,7 @@ where
             if self.next_send.is_none() {
                 return Poll::Ready(Ok(()));
             }
-            if let Some((_, callback)) = self.next_res.take() {
+            if let Some((_, callback)) = self.as_mut().project().next_res.take() {
                 // In theory, only get here when not closed...
                 if let Err(_) = callback.send(self.as_mut().project().next_send.take().unwrap()) {
                     todo!()

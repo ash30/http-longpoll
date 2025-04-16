@@ -29,11 +29,49 @@ impl Default for Config {
     }
 }
 
+// ========
+
+pin_project! {
+    pub struct Session<E:IntoPollResponse<U>,T,U> {
+        #[pin]
+        inner: PollReqStream<T,U>,
+        next: Option<(BoxFuture<'static,Result<E,Response<U>>>, ResponseCallback<U>)>,
+        buf: VecDeque<E::Buffered>,
+        max_size:usize,
+    }
+}
+
+impl<T, U, E> Session<E, T, U>
+where
+    E: IntoPollResponse<U>,
+{
+    pub fn new(s: PollReqStream<T, U>, max_size: usize) -> Self {
+        let mut buf = VecDeque::default();
+        buf.make_contiguous();
+        Session {
+            inner: s,
+            next: None,
+            buf,
+            max_size,
+        }
+    }
+}
+
+impl<T> FromPollRequest<Body> for T
+where
+    T: FromRequest<()>,
+{
+    fn from_poll_req(req: Request) -> impl Future<Output = Result<Self, Response>> + Send {
+        T::from_request(req, &()).map_err(|e| e.into_response())
+    }
+}
+
+// ========
+
 //#[cfg(feature = "axum")]
 pub mod axum {
     use crate::session::Len;
     use crate::IntoPollResponse;
-    use crate::Session;
     use axum::body::Body;
     use axum::response::Response;
     pub use bytes::Bytes;
@@ -70,6 +108,7 @@ where
         let (p_tx, p_rx) = mpsc::channel(config.request_capactiy);
         let (m_tx, m_rx) = mpsc::channel(config.request_capactiy);
         let s = Session::new(
+            PollReqStream::new(ReqStream::new(p_rx)),
             PollReqStream::new(ReqStream::new(p_rx)),
             config.message_max_size,
         );
