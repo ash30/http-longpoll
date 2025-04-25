@@ -7,8 +7,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use axum_longpoll::{HTTPLongPoll, Sender, Session};
 use futures_util::{SinkExt, StreamExt};
+use http_longpoll::axum::{Sender, Session};
 use std::sync::RwLock;
 use uuid7::{uuid7, Uuid};
 
@@ -62,10 +62,12 @@ async fn session_new(State(state): State<LongPollState>) -> impl IntoResponse {
     // client code should clean up sender on task complete
     let cleanup = (id, state.clone());
 
-    let sender = HTTPLongPoll::default().connect(move |s| async move {
-        session_handler(s).await;
+    let (sender, session) = Session::connect(http_longpoll::Config::default());
+    tokio::spawn(async move {
+        session_handler(session).await;
         cleanup.1.sessions.write().unwrap().remove(&cleanup.0);
     });
+
     state.sessions.write().unwrap().insert(id, sender);
     Json(id)
 }
@@ -76,7 +78,7 @@ async fn session_poll(
     Path(session_id): Path<Uuid>,
     req: Request,
 ) -> Result<Response, Error> {
-    let mut session = state
+    let mut session_handle = state
         .sessions
         .read()
         .unwrap()
@@ -86,7 +88,10 @@ async fn session_poll(
 
     // Session errors are fatal, client code should clean up and
     // inform client to init newconnection
-    session.send(req).await.map_err(|_| Error::SessionError)
+    session_handle
+        .poll(req)
+        .await
+        .map_err(|_| Error::SessionError)
 }
 
 // Longpoll task allows consuming code to treat the disparate http requests

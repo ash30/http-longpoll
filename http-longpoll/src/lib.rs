@@ -1,20 +1,18 @@
 #![feature(trace_macros)]
 
 mod http_poll;
-mod session;
 
-use std::sync::mpsc::TrySendError;
-
+use futures::{Sink, Stream};
 use http::{Request, Response};
+use http_poll::{
+    ForwardedReq, ForwardedReqChan, FromPollRequest, HTTPPollError, IntoPollResponse,
+    PollRequestExtractor, ResponseFramer, Writer,
+};
+use pin_project_lite::pin_project;
 use tokio::sync::{mpsc, oneshot};
 
-use http_poll::{ForwardedReq, PollReqStream, ReqStream};
-use session::{FromPollRequest, IntoPollResponse};
-
-pub use session::Session;
-
 // API
-
+#[derive(Copy, Clone)]
 pub struct Config {
     pub message_max_size: usize,
     pub request_capactiy: usize,
@@ -24,61 +22,27 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             message_max_size: 1 << 20,
-            request_capactiy: 32,
+            request_capactiy: 16,
         }
     }
 }
-
-// ========
-
-pin_project! {
-    pub struct Session<E:IntoPollResponse<U>,T,U> {
-        #[pin]
-        inner: PollReqStream<T,U>,
-        next: Option<(BoxFuture<'static,Result<E,Response<U>>>, ResponseCallback<U>)>,
-        buf: VecDeque<E::Buffered>,
-        max_size:usize,
-    }
-}
-
-impl<T, U, E> Session<E, T, U>
-where
-    E: IntoPollResponse<U>,
-{
-    pub fn new(s: PollReqStream<T, U>, max_size: usize) -> Self {
-        let mut buf = VecDeque::default();
-        buf.make_contiguous();
-        Session {
-            inner: s,
-            next: None,
-            buf,
-            max_size,
-        }
-    }
-}
-
-impl<T> FromPollRequest<Body> for T
-where
-    T: FromRequest<()>,
-{
-    fn from_poll_req(req: Request) -> impl Future<Output = Result<Self, Response>> + Send {
-        T::from_request(req, &()).map_err(|e| e.into_response())
-    }
-}
-
-// ========
 
 //#[cfg(feature = "axum")]
 pub mod axum {
-    use crate::session::Len;
-    use crate::IntoPollResponse;
+    use crate::http_poll::{ForwardedReqChan, FromPollRequest, IntoPollResponse, Len};
     use axum::body::Body;
+    use axum::extract::{FromRequest, Request};
     use axum::response::Response;
     pub use bytes::Bytes;
     use bytes::BytesMut;
+    use futures::Future;
 
-    pub type HTTPLongPoll<E> = Session<E, Body, Body>;
+    pub type Session<E = Bytes> = super::Session<E, ForwardedReqChan<Body>>;
+    pub use super::Sender;
 
+    // Allow common response types to be used as aggregate longpoll response bodies
+    //
+    // Bytes
     impl Len for Bytes {
         fn len(&self) -> usize {
             self.len()
@@ -98,21 +62,156 @@ pub mod axum {
             Response::new(U::from(out.freeze()))
         }
     }
+
+    // Allow extractors to be used within message stream
+    impl<T> FromPollRequest<Body> for T
+    where
+        T: FromRequest<()> + 'static,
+    {
+        type Error = T::Rejection;
+        fn from_poll_req(req: Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+            T::from_request(req, &())
+        }
+    }
 }
 
-impl<E, T, U> Session<E, T, U>
+// Trait to simplify external API
+trait LongPollRequestStream: Stream<Item = ForwardedReq<Self::Body>> {
+    type Body: From<()>;
+}
+
+impl<T> LongPollRequestStream for ForwardedReqChan<T>
 where
-    E: IntoPollResponse<U> + FromPollRequest<T> + Send + 'static,
+    T: From<()>,
 {
-    pub fn connect(config: &Config) -> (Sender<T, U>, Session<E, T, U>) {
+    type Body = T;
+}
+
+pin_project! {
+    struct Session<E,S> where S:LongPollRequestStream, E:FromPollRequest<S::Body>, E:IntoPollResponse<S::Body>{
+        #[pin]
+        read: PollRequestExtractor<E,S,S::Body>,
+        #[pin]
+        write: ResponseFramer<E,Writer<S,S::Body>,S::Body>
+    }
+}
+
+impl<E, S> Session<E, S>
+where
+    S: LongPollRequestStream,
+    E: FromPollRequest<S::Body>,
+    E: IntoPollResponse<S::Body>,
+{
+    fn new(read: S, write: S, max_size: usize) -> Self {
+        Self {
+            read: PollRequestExtractor::new(read),
+            write: ResponseFramer::new(max_size, Writer::new(write)),
+        }
+    }
+}
+// PROXY STREAM AND SINK
+impl<E, S> Stream for Session<E, S>
+where
+    S: LongPollRequestStream,
+    E: FromPollRequest<S::Body>,
+    E: IntoPollResponse<S::Body>,
+{
+    type Item = Result<E, HTTPPollError>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.project().read.poll_next(cx)
+    }
+}
+
+// PROXY STREAM AND SINK
+impl<E, S> Sink<Response<S::Body>> for Session<E, S>
+where
+    S: LongPollRequestStream,
+    E: FromPollRequest<S::Body>,
+    E: IntoPollResponse<S::Body>,
+{
+    fn poll_ready(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.project().write.poll_ready(cx)
+    }
+
+    fn start_send(
+        self: std::pin::Pin<&mut Self>,
+        item: Response<S::Body>,
+    ) -> Result<(), Self::Error> {
+        self.project().write.start_send(item)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.project().write.poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.project().write.poll_close(cx)
+    }
+}
+
+//
+impl<E, B> Session<E, ForwardedReqChan<B>>
+where
+    E: FromPollRequest<B>,
+    E: IntoPollResponse<B>,
+    B: From<()>,
+{
+    pub fn connect(config: Config) -> (Sender<B>, Session<E, ForwardedReqChan<B>>) {
         let (p_tx, p_rx) = mpsc::channel(config.request_capactiy);
         let (m_tx, m_rx) = mpsc::channel(config.request_capactiy);
-        let s = Session::new(
-            PollReqStream::new(ReqStream::new(p_rx)),
-            PollReqStream::new(ReqStream::new(p_rx)),
-            config.message_max_size,
-        );
-        (Sender { tx: p_tx }, s)
+        (
+            Sender {
+                msg: m_tx,
+                poll: p_tx,
+            },
+            Session::new(
+                ForwardedReqChan::new(m_rx),
+                ForwardedReqChan::new(p_rx),
+                config.message_max_size,
+            ),
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct Sender<B> {
+    msg: mpsc::Sender<ForwardedReq<B>>,
+    poll: mpsc::Sender<ForwardedReq<B>>,
+}
+
+// Implement Clone manually to avoid B affecting derive
+impl<B> Clone for Sender<B> {
+    fn clone(&self) -> Self {
+        Self {
+            msg: self.msg.clone(),
+            poll: self.poll.clone(),
+        }
+    }
+}
+
+impl<B> Sender<B> {
+    pub async fn msg(&mut self, item: Request<B>) -> Result<Response<B>, SenderError<Request<B>>> {
+        let (tx, rx) = oneshot::channel();
+        self.msg.try_send((item, tx))?;
+        rx.await.map_err(|e| e.into())
+    }
+
+    pub async fn poll(&mut self, item: Request<B>) -> Result<Response<B>, SenderError<Request<B>>> {
+        let (tx, rx) = oneshot::channel();
+        self.poll.try_send((item, tx))?;
+        rx.await.map_err(|e| e.into())
     }
 }
 
@@ -121,8 +220,9 @@ pub enum SenderError<T> {
     Full(T),
     Closed(Option<T>),
 }
-impl<T, U> From<mpsc::error::TrySendError<ForwardedReq<T, U>>> for SenderError<Request<T>> {
-    fn from(value: mpsc::error::TrySendError<ForwardedReq<T, U>>) -> Self {
+
+impl<T> From<mpsc::error::TrySendError<ForwardedReq<T>>> for SenderError<Request<T>> {
+    fn from(value: mpsc::error::TrySendError<ForwardedReq<T>>) -> Self {
         match value {
             mpsc::error::TrySendError::Closed(v) => Self::Closed(Some(v.0)),
             mpsc::error::TrySendError::Full(v) => Self::Full(v.0),
@@ -132,27 +232,6 @@ impl<T, U> From<mpsc::error::TrySendError<ForwardedReq<T, U>>> for SenderError<R
 impl<T> From<oneshot::error::RecvError> for SenderError<Request<T>> {
     fn from(_: oneshot::error::RecvError) -> Self {
         Self::Closed(None)
-    }
-}
-
-#[derive(Debug)]
-pub struct Sender<T, U> {
-    tx: mpsc::Sender<ForwardedReq<T, U>>,
-}
-
-impl<T, U> Clone for Sender<T, U> {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-        }
-    }
-}
-
-impl<T, U> Sender<T, U> {
-    pub async fn send(&mut self, item: Request<T>) -> Result<Response<U>, SenderError<Request<T>>> {
-        let (tx, rx) = oneshot::channel();
-        self.tx.try_send((item, tx))?;
-        rx.await.map_err(|e| e.into())
     }
 }
 
