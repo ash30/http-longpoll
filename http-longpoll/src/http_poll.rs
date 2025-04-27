@@ -50,40 +50,70 @@ pin_project! {
     pub struct Writer<S,B> {
         #[pin]
         stream:S,
-        next_send: Option<Response<B>>,
-        next_res:Option<ForwardedReq<B>>,
+        state: WriterState<B>
     }
 }
+
+enum WriterState<B> {
+    Open {
+        next: Option<Response<B>>,
+        out: Option<ForwardedReq<B>>,
+    },
+    Closed(WriterError),
+}
+
+// We cannot move stream once its pinned!
+// so to close it...
+//
+// We will need to KNOW S, to call close
 
 impl<S, B> Writer<S, B> {
     pub fn new(stream: S) -> Self {
         Self {
-            next_res: None,
-            next_send: None,
+            state: WriterState::Open {
+                next: None,
+                out: None,
+            },
             stream,
         }
     }
 }
 
-enum SenderError {
-    MultiplePoll,
-}
 #[derive(Copy, Clone, Debug)]
-pub enum HTTPPollError {
-    RemoteClose,
-    LocalClose,
-    AlreadyClosed,
+enum WriterError {
+    ClientClose,
+    ServerClose,
+    Closed,
     PollingError,
 }
 
+macro_rules! is_open {
+    ($e:expr) => {
+        match $e {
+            WriterState::Closed(ref r) => return Poll::Ready(Err(*r)),
+            WriterState::Open {
+                ref mut next,
+                ref mut out,
+            } => (next, out),
+        }
+    };
+}
 impl<S, B> Writer<S, B>
 where
     S: Stream<Item = ForwardedReq<B>>,
 {
-    fn poll_inner(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), SenderError>> {
-        let n = ready!(self.as_mut().project().stream.poll_next(cx))?;
-        self.as_mut().next_res.replace(n);
-        Ok(());
+    fn poll_inner(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WriterError>> {
+        let this = self.project();
+
+        // We should change this to auto answer
+        let (_, out) = is_open!(this.state);
+        if let Some(n) = ready!(this.stream.poll_next(cx)) {
+            out.replace(n);
+            Poll::Ready(Ok(()))
+        } else {
+            *(this.state) = WriterState::Closed(WriterError::ClientClose);
+            Poll::Ready(Err(WriterError::ClientClose))
+        }
     }
 }
 
@@ -91,24 +121,25 @@ impl<S, B> Sink<Response<B>> for Writer<S, B>
 where
     S: Stream<Item = ForwardedReq<B>>,
 {
-    type Error = SenderError;
+    type Error = WriterError;
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        //self.close(HTTPPollError::LocalClose);
+        *(self.project().state) = WriterState::Closed(WriterError::ServerClose);
         Poll::Ready(Ok(()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         loop {
-            if self.next_send.is_none() {
+            let (next, out) = is_open!(self.as_mut().project().state);
+            if next.is_none() {
                 return Poll::Ready(Ok(()));
             }
-            if let Some((_, callback)) = self.as_mut().project().next_res.take() {
-                // In theory, only get here when not closed...
-                if let Err(_) = callback.send(self.as_mut().project().next_send.take().unwrap()) {
-                    todo!()
-                    //return Poll::Ready(Err(todo!()));
+            if let Some((_, callback)) = out.take() {
+                if let Err(_) = callback.send(next.take().unwrap()) {
+                    // Could not return response to poll request...
+                    // assume worst and tear down
+                    return Poll::Ready(Err(WriterError::PollingError));
                 }
             } else {
                 ready!(self.as_mut().poll_inner(cx))?;
@@ -117,21 +148,21 @@ where
     }
 
     fn start_send(self: Pin<&mut Self>, item: Response<B>) -> Result<(), Self::Error> {
-        if self.next_send.is_some() {
-            todo!()
-            // Err(todo!());
-        } else {
-            self.project().next_send.replace(item);
-            Ok(())
+        match self.project().state {
+            WriterState::Closed(ref r) => return Err(*r),
+            WriterState::Open { ref mut next, .. } => {
+                next.replace(item);
+            }
         }
+        Ok(())
     }
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        // always poll source to check for multiple
-        // req error
+        // poll source to check for multiple req error
         self.as_mut().poll_inner(cx)?;
-        if self.next_res.is_some() {
+        let (_, out) = is_open!(self.as_mut().project().state);
+        if out.is_some() {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -178,10 +209,7 @@ where
     E: IntoPollResponse<B>,
     S: Sink<Response<B>>,
 {
-    fn poll_empty(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), HTTPPollError>> {
+    fn poll_empty(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
         loop {
             if self.buf.is_empty() {
                 return Poll::Ready(Ok(()));
@@ -206,24 +234,24 @@ where
     }
 }
 
-pub enum FrameError<E> {
-    InvalidMessage(E),
-    SendLimit,
-    Polling(HTTPPollError),
+pub enum MessageError<E1, E2> {
+    InvalidMessage(E1),
+    SendError(E2),
+    SizeLimit,
 }
 
-impl<E> From<HTTPPollError> for FrameError<E> {
-    fn from(value: HTTPPollError) -> Self {
-        FrameError::Polling(value)
+impl<E, W_ERR> From<W_ERR> for MessageError<E, W_ERR> {
+    fn from(value: W_ERR) -> Self {
+        MessageError::SendError(value)
     }
 }
 
 impl<E, S, B> Sink<E> for ResponseFramer<E, S, B>
 where
-    S: Sink<Response<B>>,
+    S: Sink<Response<B>, Error = WriterError>,
     E: IntoPollResponse<B>,
 {
-    type Error = FrameError<<E::Buffered as TryFrom<E>>::Error>;
+    type Error = MessageError<<E::Buffered as TryFrom<E>>::Error, S::Error>;
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
@@ -237,9 +265,9 @@ where
     }
 
     fn start_send(self: Pin<&mut Self>, item: E) -> Result<(), Self::Error> {
-        let n: E::Buffered = item.try_into().map_err(FrameError::InvalidMessage)?;
+        let n: E::Buffered = item.try_into().map_err(MessageError::InvalidMessage)?;
         if n.len() > self.max_size {
-            Err(FrameError::SendLimit)
+            Err(MessageError::SizeLimit)
         } else {
             self.project().buf.push_back(n);
             Ok(())
@@ -286,7 +314,7 @@ where
     E: FromPollRequest<B>,
     B: From<()>,
 {
-    type Item = Result<E, HTTPPollError>;
+    type Item = Result<E, E::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(loop {
@@ -305,11 +333,7 @@ where
                         .body(().into())
                         .unwrap(),
                 );
-                if e.is_ok() {
-                    break Some(e.map_err(|_| HTTPPollError::PollingError));
-                } else {
-                    continue;
-                }
+                break Some(e);
             } else if let Some((req, res)) = ready!(this.inner.poll_next(cx)) {
                 // get next extractor fut
                 let _ = this.next.replace((E::from_poll_req(req).boxed(), res));

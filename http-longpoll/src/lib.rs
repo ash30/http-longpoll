@@ -126,7 +126,7 @@ where
 }
 
 // PROXY STREAM AND SINK
-impl<E, S> Sink<Response<S::Body>> for Session<E, S>
+impl<E, S> Sink<E> for Session<E, S>
 where
     S: LongPollRequestStream,
     E: FromPollRequest<S::Body>,
@@ -139,10 +139,7 @@ where
         self.project().write.poll_ready(cx)
     }
 
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: Response<S::Body>,
-    ) -> Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: E) -> Result<(), Self::Error> {
         self.project().write.start_send(item)
     }
 
