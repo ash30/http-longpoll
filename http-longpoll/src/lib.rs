@@ -5,8 +5,8 @@ mod http_poll;
 use futures::{Sink, Stream};
 use http::{Request, Response};
 use http_poll::{
-    ForwardedReq, ForwardedReqChan, FromPollRequest, HTTPPollError, IntoPollResponse,
-    PollRequestExtractor, ResponseFramer, Writer,
+    ForwardedReq, ForwardedReqChan, FromPollRequest, IntoPollResponse, PollRequestExtractor,
+    ResponseFramer, Writer,
 };
 use pin_project_lite::pin_project;
 use tokio::sync::{mpsc, oneshot};
@@ -110,78 +110,79 @@ where
     }
 }
 // PROXY STREAM AND SINK
-impl<E, S> Stream for Session<E, S>
-where
-    S: LongPollRequestStream,
-    E: FromPollRequest<S::Body>,
-    E: IntoPollResponse<S::Body>,
-{
-    type Item = Result<E, HTTPPollError>;
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.project().read.poll_next(cx)
-    }
-}
-
-// PROXY STREAM AND SINK
-impl<E, S> Sink<E> for Session<E, S>
-where
-    S: LongPollRequestStream,
-    E: FromPollRequest<S::Body>,
-    E: IntoPollResponse<S::Body>,
-{
-    fn poll_ready(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.project().write.poll_ready(cx)
-    }
-
-    fn start_send(self: std::pin::Pin<&mut Self>, item: E) -> Result<(), Self::Error> {
-        self.project().write.start_send(item)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.project().write.poll_flush(cx)
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.project().write.poll_close(cx)
-    }
-}
-
+//impl<E, S> Stream for Session<E, S>
+//where
+//    S: LongPollRequestStream,
+//    E: FromPollRequest<S::Body>,
+//    E: IntoPollResponse<S::Body>,
+//{
+//    fn poll_next(
+//        self: std::pin::Pin<&mut Self>,
+//        cx: &mut std::task::Context<'_>,
+//    ) -> std::task::Poll<Option<Self::Item>> {
+//        self.project().read.poll_next(cx)
+//    }
+//}
 //
-impl<E, B> Session<E, ForwardedReqChan<B>>
-where
-    E: FromPollRequest<B>,
-    E: IntoPollResponse<B>,
-    B: From<()>,
-{
-    pub fn connect(config: Config) -> (Sender<B>, Session<E, ForwardedReqChan<B>>) {
-        let (p_tx, p_rx) = mpsc::channel(config.request_capactiy);
-        let (m_tx, m_rx) = mpsc::channel(config.request_capactiy);
-        (
-            Sender {
-                msg: m_tx,
-                poll: p_tx,
-            },
-            Session::new(
-                ForwardedReqChan::new(m_rx),
-                ForwardedReqChan::new(p_rx),
-                config.message_max_size,
-            ),
-        )
-    }
-}
-
+//// PROXY STREAM AND SINK
+//impl<E, S> Sink<E> for Session<E, S>
+//where
+//    S: LongPollRequestStream,
+//    E: FromPollRequest<S::Body>,
+//    E: IntoPollResponse<S::Body>,
+//{
+//    type Error = ;
+//
+//    fn poll_ready(
+//        mut self: std::pin::Pin<&mut Self>,
+//        cx: &mut std::task::Context<'_>,
+//    ) -> std::task::Poll<Result<(), Self::Error>> {
+//        self.project().write.poll_ready(cx)
+//    }
+//
+//    fn start_send(self: std::pin::Pin<&mut Self>, item: E) -> Result<(), Self::Error> {
+//        self.project().write.start_send(item)
+//    }
+//
+//    fn poll_flush(
+//        self: std::pin::Pin<&mut Self>,
+//        cx: &mut std::task::Context<'_>,
+//    ) -> std::task::Poll<Result<(), Self::Error>> {
+//        self.project().write.poll_flush(cx)
+//    }
+//
+//    fn poll_close(
+//        self: std::pin::Pin<&mut Self>,
+//        cx: &mut std::task::Context<'_>,
+//    ) -> std::task::Poll<Result<(), Self::Error>> {
+//        self.project().write.poll_close(cx)
+//    }
+//}
+//
+////
+//impl<E, B> Session<E, ForwardedReqChan<B>>
+//where
+//    E: FromPollRequest<B>,
+//    E: IntoPollResponse<B>,
+//    B: From<()>,
+//{
+//    pub fn connect(config: Config) -> (Sender<B>, Session<E, ForwardedReqChan<B>>) {
+//        let (p_tx, p_rx) = mpsc::channel(config.request_capactiy);
+//        let (m_tx, m_rx) = mpsc::channel(config.request_capactiy);
+//        (
+//            Sender {
+//                msg: m_tx,
+//                poll: p_tx,
+//            },
+//            Session::new(
+//                ForwardedReqChan::new(m_rx),
+//                ForwardedReqChan::new(p_rx),
+//                config.message_max_size,
+//            ),
+//        )
+//    }
+//}
+//
 #[derive(Debug)]
 pub struct Sender<B> {
     msg: mpsc::Sender<ForwardedReq<B>>,

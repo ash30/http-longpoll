@@ -6,6 +6,7 @@ use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use tokio::sync::oneshot::Sender;
 use tokio::sync::{mpsc, oneshot};
 
 pub type ResponseCallback<U> = oneshot::Sender<Response<U>>;
@@ -80,10 +81,9 @@ impl<S, B> Writer<S, B> {
 }
 
 #[derive(Copy, Clone, Debug)]
-enum WriterError {
+pub enum WriterError {
     ClientClose,
     ServerClose,
-    Closed,
     PollingError,
 }
 
@@ -101,18 +101,39 @@ macro_rules! is_open {
 impl<S, B> Writer<S, B>
 where
     S: Stream<Item = ForwardedReq<B>>,
+    B: From<()>,
 {
+    // The idea is to only poll inner when no current poll or current poll + no data
     fn poll_inner(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WriterError>> {
         let this = self.project();
-
-        // We should change this to auto answer
         let (_, out) = is_open!(this.state);
-        if let Some(n) = ready!(this.stream.poll_next(cx)) {
-            out.replace(n);
-            Poll::Ready(Ok(()))
-        } else {
-            *(this.state) = WriterState::Closed(WriterError::ClientClose);
-            Poll::Ready(Err(WriterError::ClientClose))
+
+        match ready!(this.stream.poll_next(cx)) {
+            Some(new_poll) => {
+                // IF already polling, fatal error
+                if out.is_some() {
+                    let current_req = out.take().unwrap();
+                    let close = |sender: Sender<Response<B>>| {
+                        let _ = sender.send(
+                            Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(().into())
+                                .unwrap(),
+                        );
+                    };
+                    close(current_req.1);
+                    close(new_poll.1);
+                    *(this.state) = WriterState::Closed(WriterError::PollingError);
+                    Poll::Ready(Err(WriterError::PollingError))
+                } else {
+                    out.replace(new_poll);
+                    Poll::Ready(Ok(()))
+                }
+            }
+            None => {
+                *(this.state) = WriterState::Closed(WriterError::ClientClose);
+                Poll::Ready(Err(WriterError::ClientClose))
+            }
         }
     }
 }
@@ -120,6 +141,7 @@ where
 impl<S, B> Sink<Response<B>> for Writer<S, B>
 where
     S: Stream<Item = ForwardedReq<B>>,
+    B: From<()>,
 {
     type Error = WriterError;
 
@@ -158,8 +180,10 @@ where
     }
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // poll before checking 'out' to catch multiple req error from clients
+        // but only if no current data, we want to ensure once data is given to the sink
+        // it gets there OR has a way of being returned ....
         ready!(self.as_mut().poll_flush(cx))?;
-        // poll source to check for multiple req error
         self.as_mut().poll_inner(cx)?;
         let (_, out) = is_open!(self.as_mut().project().state);
         if out.is_some() {
@@ -346,3 +370,66 @@ where
 }
 
 // =====
+//
+#[cfg(test)]
+mod tests {
+    use futures::stream::empty;
+    use futures::task::noop_waker_ref;
+    use futures::{pin_mut, stream};
+    use futures::{stream::pending, SinkExt};
+    use futures_test::future::FutureTestExt;
+    use futures_test::{assert_stream_done, assert_stream_next, assert_stream_pending};
+    use std::task::{ready, Context, Poll};
+    use tokio::sync::oneshot;
+    use tokio_test::{assert_pending, assert_ready_err, assert_ready_ok};
+
+    use crate::http_poll::WriterError;
+
+    use super::{ForwardedReq, Writer};
+
+    fn poll_req() -> ForwardedReq<()> {
+        let (tx, rx) = oneshot::channel();
+        (http::Request::builder().body(()).unwrap(), tx)
+    }
+
+    #[test]
+    fn writer_ready_no_poll_should_be_pending() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut sut = Writer::<_, ()>::new(pending::<ForwardedReq<()>>());
+        let result = sut.poll_ready_unpin(&mut cx);
+        assert_pending!(result)
+    }
+
+    #[test]
+    fn writer_ready() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let inner = stream::iter(vec![poll_req()]);
+        let mut sut = Writer::<_, ()>::new(inner);
+        let result = sut.poll_ready_unpin(&mut cx);
+        assert_ready_ok!(result)
+    }
+
+    #[test]
+    fn writer_client_close() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut sut = Writer::<_, ()>::new(empty::<ForwardedReq<()>>());
+        let result = sut.poll_ready_unpin(&mut cx);
+        let result = assert_ready_err!(result);
+        assert!(matches!(result, WriterError::ClientClose));
+    }
+
+    #[test]
+    fn writer_double_poll() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let inner = stream::iter(vec![poll_req(), poll_req()]);
+        let mut sut = Writer::<_, ()>::new(inner);
+        let _ = sut.poll_ready_unpin(&mut cx);
+        let result = sut.poll_ready_unpin(&mut cx);
+        let result = assert_ready_err!(result);
+        assert!(
+            matches!(result, WriterError::PollingError),
+            "got {:?}",
+            result
+        );
+    }
+}
