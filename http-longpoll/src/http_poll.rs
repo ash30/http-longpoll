@@ -4,6 +4,7 @@ use futures::future::BoxFuture;
 use futures::{Future, FutureExt, Sink, Stream};
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
+use std::error::Error;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use tokio::sync::oneshot::Sender;
@@ -202,7 +203,8 @@ pub trait Len {
 }
 
 pub trait IntoPollResponse<U>: Sized {
-    type Buffered: TryFrom<Self> + Len + Send;
+    type Buffered: TryFrom<Self, Error = Self::Err> + Len + Send;
+    type Err: Error + 'static;
     fn into_poll_response(buf: Vec<Self::Buffered>) -> Response<U>;
 }
 
@@ -258,24 +260,24 @@ where
     }
 }
 
-pub enum MessageError<E1, E2> {
-    InvalidMessage(E1),
-    SendError(E2),
+pub enum ResponseFramerError<E> {
+    SendError(E),
+    InvalidMessage(Box<dyn Error>),
     SizeLimit,
 }
 
-impl<E, W_ERR> From<W_ERR> for MessageError<E, W_ERR> {
-    fn from(value: W_ERR) -> Self {
-        MessageError::SendError(value)
+impl<E> From<E> for ResponseFramerError<E> {
+    fn from(value: E) -> Self {
+        ResponseFramerError::SendError(value)
     }
 }
 
 impl<E, S, B> Sink<E> for ResponseFramer<E, S, B>
 where
-    S: Sink<Response<B>, Error = WriterError>,
+    S: Sink<Response<B>>,
     E: IntoPollResponse<B>,
 {
-    type Error = MessageError<<E::Buffered as TryFrom<E>>::Error, S::Error>;
+    type Error = ResponseFramerError<S::Error>;
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
@@ -289,9 +291,11 @@ where
     }
 
     fn start_send(self: Pin<&mut Self>, item: E) -> Result<(), Self::Error> {
-        let n: E::Buffered = item.try_into().map_err(MessageError::InvalidMessage)?;
+        let n: E::Buffered = item
+            .try_into()
+            .map_err(|e| ResponseFramerError::InvalidMessage(Box::new(e)))?;
         if n.len() > self.max_size {
-            Err(MessageError::SizeLimit)
+            Err(ResponseFramerError::SizeLimit)
         } else {
             self.project().buf.push_back(n);
             Ok(())
