@@ -13,6 +13,11 @@ use tokio::sync::{mpsc, oneshot};
 pub type ResponseCallback<U> = oneshot::Sender<Response<U>>;
 pub type ForwardedReq<T> = (Request<T>, ResponseCallback<T>);
 
+fn forward_request<T>(r: Request<T>) -> (ForwardedReq<T>, oneshot::Receiver<Response<T>>) {
+    let (tx, rx) = oneshot::channel();
+    ((r, tx), rx)
+}
+
 pin_project! {
     #[derive(Debug)]
     pub struct ForwardedReqChan<T> {
@@ -159,12 +164,14 @@ where
                 return Poll::Ready(Ok(()));
             }
             if let Some((_, callback)) = out.take() {
+                println!("test1");
                 if let Err(_) = callback.send(next.take().unwrap()) {
                     // Could not return response to poll request...
                     // assume worst and tear down
                     return Poll::Ready(Err(WriterError::PollingError));
                 }
             } else {
+                println!("test2");
                 ready!(self.as_mut().poll_inner(cx))?;
             }
         }
@@ -383,11 +390,12 @@ mod tests {
     use futures::{stream::pending, SinkExt};
     use futures_test::future::FutureTestExt;
     use futures_test::{assert_stream_done, assert_stream_next, assert_stream_pending};
+    use http::Request;
     use std::task::{ready, Context, Poll};
     use tokio::sync::oneshot;
-    use tokio_test::{assert_pending, assert_ready_err, assert_ready_ok};
+    use tokio_test::{assert_ok, assert_pending, assert_ready_err, assert_ready_ok};
 
-    use crate::http_poll::WriterError;
+    use crate::http_poll::{forward_request, WriterError};
 
     use super::{ForwardedReq, Writer};
 
@@ -414,18 +422,12 @@ mod tests {
     }
 
     #[test]
-    fn writer_client_close() {
+    fn writer_ready_double_poll() {
         let mut cx = Context::from_waker(noop_waker_ref());
-        let mut sut = Writer::<_, ()>::new(empty::<ForwardedReq<()>>());
-        let result = sut.poll_ready_unpin(&mut cx);
-        let result = assert_ready_err!(result);
-        assert!(matches!(result, WriterError::ClientClose));
-    }
+        let (req1, rx1) = forward_request(Request::new(()));
+        let (req2, rx2) = forward_request(Request::new(()));
+        let inner = stream::iter(vec![req1, req2]);
 
-    #[test]
-    fn writer_double_poll() {
-        let mut cx = Context::from_waker(noop_waker_ref());
-        let inner = stream::iter(vec![poll_req(), poll_req()]);
         let mut sut = Writer::<_, ()>::new(inner);
         let _ = sut.poll_ready_unpin(&mut cx);
         let result = sut.poll_ready_unpin(&mut cx);
@@ -435,5 +437,31 @@ mod tests {
             "got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn writer_ready_double_poll_with_data() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let (req1, rx1) = forward_request(Request::new(()));
+        let (req2, rxw) = forward_request(Request::new(()));
+        let inner = stream::iter(vec![req1, req2]);
+
+        let mut sut = Writer::<_, ()>::new(inner);
+        assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
+
+        let send_result = sut.start_send_unpin(http::Response::builder().body(()).unwrap());
+        assert_ok!(send_result, "send data");
+
+        let result = sut.poll_ready_unpin(&mut cx);
+        let result = assert_ready_ok!(result);
+    }
+
+    #[test]
+    fn writer_client_close() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut sut = Writer::<_, ()>::new(empty::<ForwardedReq<()>>());
+        let result = sut.poll_ready_unpin(&mut cx);
+        let result = assert_ready_err!(result);
+        assert!(matches!(result, WriterError::ClientClose));
     }
 }
