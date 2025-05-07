@@ -54,10 +54,8 @@ where
 
 #[derive(Copy, Clone, Debug)]
 pub enum WriterError {
-    ClientClose,
-    ServerClose,
     PollingError,
-    AlreadyClosed,
+    Closed,
 }
 
 macro_rules! is_open {
@@ -95,8 +93,8 @@ where
                 }
             }
             None => {
-                *(this.state) = WriterState::Closed(WriterError::ClientClose);
-                Poll::Ready(Err(WriterError::ClientClose))
+                *(this.state) = WriterState::Closed(WriterError::Closed);
+                Poll::Ready(Err(WriterError::Closed))
             }
         }
     }
@@ -111,7 +109,7 @@ where
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        *(self.project().state) = WriterState::Closed(WriterError::ServerClose);
+        *(self.project().state) = WriterState::Closed(WriterError::Closed);
         Poll::Ready(Ok(()))
     }
 
@@ -124,7 +122,7 @@ where
             if let Some(callback) = out.take() {
                 if let Err(_) = callback.send(
                     next.take()
-                        .ok_or_else(|| WriterError::PollingError)
+                        .ok_or(WriterError::PollingError)
                         // We assume next is always Ok
                         .map(|r| r.unwrap()),
                 ) {
@@ -241,16 +239,16 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        self.project().inner.poll_close(cx).map_err(|e| e.into())
+        self.project().inner.poll_close(cx)
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), Self::Error>> {
-        ready!(self.as_mut().poll_empty(cx))?;
         // need to flush the last one too
-        self.project().inner.poll_flush(cx).map_err(|e| e.into())
+        ready!(self.as_mut().poll_empty(cx))?;
+        self.project().inner.poll_flush(cx)
     }
 
     // We don't inforce maxsize on individual items, left to calling code to enforce if they care
@@ -348,6 +346,6 @@ mod tests {
         let mut sut = Writer::new(empty::<TestResponse>());
         let result = sut.poll_ready_unpin(&mut cx);
         let result = assert_ready_err!(result);
-        assert!(matches!(result, WriterError::ClientClose));
+        assert!(matches!(result, WriterError::Closed));
     }
 }

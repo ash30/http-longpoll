@@ -88,10 +88,7 @@ async fn session_poll(
 
     // Session errors are fatal, client code should clean up and
     // inform client to init newconnection
-    session_handle
-        .poll(req)
-        .await
-        .map_err(|_| Error::SessionError)
+    session_handle.poll().await.map_err(|_| Error::SessionError)
 }
 
 // Longpoll task allows consuming code to treat the disparate http requests

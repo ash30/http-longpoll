@@ -2,11 +2,13 @@
 
 mod http_poll;
 
-use futures::{Sink, Stream};
-use http_poll::{Appendable, Callback, ResponseFramer, ResultCallback, Writer, WriterError};
+use std::task::{ready, Poll};
+
+use futures::{Sink, SinkExt, Stream};
+use http_poll::{Appendable, ResponseFramer, ResultCallback, Writer, WriterError};
 use pin_project_lite::pin_project;
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::{self, ReceiverStream};
+use tokio_stream::wrappers::ReceiverStream;
 
 // API
 #[derive(Copy, Clone)]
@@ -27,7 +29,7 @@ impl Default for Config {
 pin_project! {
     struct Session<T>{
         #[pin]
-        read: ReceiverStream<T>,
+        read: ReceiverStream<Result<T,()>>,
         #[pin]
         write: ResponseFramer<Writer<ReceiverStream<ResultCallback<T>>>,T>
     }
@@ -38,7 +40,7 @@ where
     T: Appendable,
 {
     fn new(
-        read: ReceiverStream<T>,
+        read: ReceiverStream<Result<T, ()>>,
         write: ReceiverStream<ResultCallback<T>>,
         max_size: usize,
     ) -> Self {
@@ -47,16 +49,33 @@ where
             write: ResponseFramer::new(max_size, Writer::new(write)),
         }
     }
+
+    pub async fn close(&mut self) -> Result<(), SessionError> {
+        // Close read, and then poll write for flush + close
+        // calling code should drain session stream as well
+        // this is 'server' side close, but can also be used as response
+        // to 'client close' for convenience / simple api
+        self.read.close();
+        self.write.close().await
+    }
 }
 
 // PROXY STREAM AND SINK
 impl<T> Stream for Session<T> {
     type Item = T;
     fn poll_next(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.project().read.poll_next(cx)
+        match ready!(self.as_mut().project().read.poll_next(cx)) {
+            // Client close signl
+            Some(Err(_)) => {
+                self.project().read.close();
+                Poll::Ready(None)
+                // TODO: fuse it ?
+            }
+            other => Poll::Ready(other.map(|r| r.unwrap())),
+        }
     }
 }
 
@@ -115,7 +134,7 @@ where
 
 #[derive(Debug)]
 pub struct Sender<B> {
-    msg: mpsc::Sender<B>,
+    msg: mpsc::Sender<Result<B, ()>>,
     poll: mpsc::Sender<ResultCallback<B>>,
 }
 
@@ -132,20 +151,29 @@ impl<B> Clone for Sender<B> {
 type SessionError = WriterError;
 
 impl<B> Sender<B> {
+    pub async fn close(&mut self) -> Result<(), SessionError> {
+        // We send a ERR down to session and wait for read chan close
+        // Client can choose to drain remaining message or DROP handle
+        self.msg
+            .send(Err(()))
+            .await
+            .map_err(|_| SessionError::Closed)?;
+
+        self.msg.closed().await;
+        Ok(())
+    }
+
     pub async fn msg(&mut self, item: B) -> Result<(), SessionError> {
         self.msg
-            .send(item)
+            .send(Ok(item))
             .await
-            .map_err(|_| SessionError::AlreadyClosed)
+            .map_err(|_| SessionError::Closed)
     }
 
     pub async fn poll(&mut self) -> Result<B, SessionError> {
         let (tx, rx) = oneshot::channel();
-        self.poll
-            .send(tx)
-            .await
-            .map_err(|_| SessionError::AlreadyClosed)?;
-        rx.await.map_err(|_| SessionError::AlreadyClosed)?
+        self.poll.send(tx).await.map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
     }
 }
 
