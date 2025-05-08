@@ -1,14 +1,15 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Path, Request, State},
+    body::Bytes,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
-use futures_util::{SinkExt, StreamExt};
-use http_longpoll::axum::{Sender, Session};
+use futures_util::{stream, SinkExt, StreamExt};
+use http_longpoll::axum::{Session, SessionHandle};
 use std::sync::RwLock;
 use uuid7::{uuid7, Uuid};
 
@@ -16,7 +17,7 @@ use uuid7::{uuid7, Uuid};
 // and directing future request to correct key.
 #[derive(Clone, Debug)]
 struct LongPollState {
-    sessions: Arc<RwLock<HashMap<Uuid, Sender>>>,
+    sessions: Arc<RwLock<HashMap<Uuid, SessionHandle>>>,
 }
 impl LongPollState {
     fn new() -> Self {
@@ -26,29 +27,14 @@ impl LongPollState {
     }
 }
 
-enum Error {
-    SessionNotFound,
-    SessionError,
-}
-
-impl IntoResponse for Error {
-    fn into_response(self) -> Response {
-        Response::builder()
-            .status(match self {
-                Error::SessionNotFound => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            })
-            .body(().into())
-            .unwrap()
-    }
-}
-
 #[tokio::main]
 async fn main() {
     // create routes to init and poll longpoll connections
     let app = Router::new()
         .route("/session", post(session_new))
         .route("/session/{id}", get(session_poll))
+        .route("/session/{id}", post(session_msg))
+        .route("/session/{id}", delete(session_delete))
         .with_state(LongPollState::new());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -57,12 +43,10 @@ async fn main() {
 
 // setup longpoll task with default settings and store sender for future use
 async fn session_new(State(state): State<LongPollState>) -> impl IntoResponse {
-    // key for sender lookup later
     let id = uuid7();
     // client code should clean up sender on task complete
-    let cleanup = (id, state.clone());
-
     let (sender, session) = Session::connect(http_longpoll::Config::default());
+    let cleanup = (id, state.clone());
     tokio::spawn(async move {
         session_handler(session).await;
         cleanup.1.sessions.write().unwrap().remove(&cleanup.0);
@@ -76,43 +60,48 @@ async fn session_new(State(state): State<LongPollState>) -> impl IntoResponse {
 async fn session_poll(
     State(state): State<LongPollState>,
     Path(session_id): Path<Uuid>,
-    req: Request,
-) -> Result<Response, Error> {
-    let mut session_handle = state
-        .sessions
-        .read()
-        .unwrap()
-        .get(&session_id)
-        .cloned()
-        .ok_or(Error::SessionNotFound)?;
-
-    // Session errors are fatal, client code should clean up and
-    // inform client to init newconnection
-    session_handle.poll().await.map_err(|_| Error::SessionError)
+) -> Response {
+    let Some(mut session_handle) = state.sessions.read().unwrap().get(&session_id).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    session_handle.poll().await.into_response()
 }
 
-// Longpoll task allows consuming code to treat the disparate http requests
+async fn session_msg(
+    State(state): State<LongPollState>,
+    Path(session_id): Path<Uuid>,
+    data: Bytes,
+) -> Response {
+    let Some(mut session_handle) = state.sessions.read().unwrap().get(&session_id).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    session_handle.msg(data).await.into_response()
+}
+
+async fn session_delete(
+    State(state): State<LongPollState>,
+    Path(session_id): Path<Uuid>,
+) -> Response {
+    let Some(mut session_handle) = state.sessions.read().unwrap().get(&session_id).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // clients can close long poll session and will still allow x1 poll req to drain
+    session_handle.close().await.into_response()
+}
+// Longpoll task allows consuming code to treat the http requests
 // as a continuous stream of messages
 async fn session_handler(s: Session) {
-    let (mut tx, mut rx) = s.split();
-    loop {
-        tokio::select! {
-            Some(m) = rx.next() => {
-                match m {
-                    // task will be informed why connection closed
-                    Err(reason) => {
-                        break
-                    }
-                    Ok(bytes) => {
-                        // echo
-                       let Ok(_) = tx.send(bytes).await else { break };
-                    }
-                }
-            }
-            else => {
-                //
-                break
-            }
+    // take batch of messages from session and then send + flush back to http poll request
+    let (mut tx, rx) = s.split();
+    let stream = tokio_stream::StreamExt::chunks_timeout(rx, 10, Duration::from_secs(2));
+    tokio::pin!(stream);
+
+    while let Some(batch) = stream.next().await {
+        let mut b = stream::iter(batch).map(Ok);
+        if (tx.send_all(&mut b).await).is_err() {
+            break;
         }
     }
+    // Read loop breaks when session is closed by client
+    // we have already flushed reamning data, exit task!
 }
