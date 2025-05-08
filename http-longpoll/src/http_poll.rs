@@ -1,9 +1,9 @@
-use futures::{Future, FutureExt, Sink, Stream};
+use futures::{Sink, Stream};
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 pub type Callback<T> = oneshot::Sender<T>;
 pub type Result<T> = std::result::Result<T, WriterError>;
@@ -83,8 +83,8 @@ where
                 // IF already polling, fatal error
                 if out.is_some() {
                     let current_req = out.take().unwrap();
-                    current_req.send(Err(WriterError::PollingError));
-                    new_poll.send(Err(WriterError::PollingError));
+                    let _ = current_req.send(Err(WriterError::PollingError));
+                    let _ = new_poll.send(Err(WriterError::PollingError));
                     *(this.state) = WriterState::Closed(WriterError::PollingError);
                     Poll::Ready(Err(WriterError::PollingError))
                 } else {
@@ -108,7 +108,13 @@ where
     type Error = WriterError;
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // Flush remaining data before closing
         ready!(self.as_mut().poll_flush(cx))?;
+
+        // explicitly drop 'out' request incase
+        let (next, out) = is_open!(self.as_mut().project().state);
+        let _ = out.take();
+
         *(self.project().state) = WriterState::Closed(WriterError::Closed);
         Poll::Ready(Ok(()))
     }
@@ -153,7 +159,7 @@ where
         // but only if no current data, we want to ensure once data is given to the sink
         // it gets there OR has a way of being returned ....
         ready!(self.as_mut().poll_flush(cx))?;
-        self.as_mut().poll_inner(cx)?;
+        let _ = self.as_mut().poll_inner(cx)?;
         let (_, out) = is_open!(self.as_mut().project().state);
         if out.is_some() {
             Poll::Ready(Ok(()))
@@ -277,8 +283,6 @@ mod tests {
     use futures::task::noop_waker_ref;
     use futures::{pin_mut, stream};
     use futures::{stream::pending, SinkExt};
-    use futures_test::future::FutureTestExt;
-    use futures_test::{assert_stream_done, assert_stream_next, assert_stream_pending};
     use std::task::{ready, Context, Poll};
     use tokio::sync::oneshot;
     use tokio_test::{assert_ok, assert_pending, assert_ready_err, assert_ready_ok};
@@ -290,6 +294,8 @@ mod tests {
     fn writer_ready_no_poll_should_be_pending() {
         let mut cx = Context::from_waker(noop_waker_ref());
         let mut sut = Writer::new(pending::<TestResponse>());
+
+        // return Pending when no poll req
         let result = sut.poll_ready_unpin(&mut cx);
         assert_pending!(result)
     }
@@ -300,6 +306,7 @@ mod tests {
         let p1 = oneshot::channel::<Result<(), WriterError>>();
         let inner = stream::iter(vec![p1.0]);
 
+        // should be ready
         let mut sut = Writer::new(inner);
         let result = sut.poll_ready_unpin(&mut cx);
         assert_ready_ok!(result)
@@ -313,6 +320,8 @@ mod tests {
         let inner = stream::iter(vec![p1.0, p2.0]);
 
         let mut sut = Writer::new(inner);
+
+        // Polling x2 will result in polling error
         let _ = sut.poll_ready_unpin(&mut cx);
         let result = sut.poll_ready_unpin(&mut cx);
         let result = assert_ready_err!(result);
@@ -341,11 +350,89 @@ mod tests {
     }
 
     #[test]
-    fn writer_client_close() {
+    fn writer_client_stream_close() {
         let mut cx = Context::from_waker(noop_waker_ref());
         let mut sut = Writer::new(empty::<TestResponse>());
         let result = sut.poll_ready_unpin(&mut cx);
         let result = assert_ready_err!(result);
         assert!(matches!(result, WriterError::Closed));
+    }
+
+    #[test]
+    fn writer_close_with_pending_data() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut p1 = oneshot::channel::<Result<(), WriterError>>();
+        let inner = stream::iter(vec![p1.0]);
+
+        let mut sut = Writer::new(inner);
+
+        // Send data but don't flush
+        assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
+        assert_ok!(sut.start_send_unpin(()), "send data");
+
+        // Close should try to flush pending data first
+        let close_result = sut.poll_close_unpin(&mut cx);
+        assert_ready_ok!(close_result);
+
+        // Verify data was sent through callback
+        let received = assert_ok!(p1.1.try_recv());
+        assert_ok!(received, "callback received data");
+    }
+
+    #[test]
+    fn writer_close_during_active_poll() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut p1 = oneshot::channel::<Result<(), WriterError>>();
+        let inner = stream::iter(vec![p1.0]);
+
+        let mut sut = Writer::new(inner);
+
+        // Get ready with active poll
+        assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
+
+        // Close with active poll
+        let close_result = sut.poll_close_unpin(&mut cx);
+        assert_ready_ok!(close_result);
+
+        // Verify callback got closed error
+        let received = assert_ok!(p1.1.try_recv());
+        assert!(matches!(received, Err(WriterError::Closed)));
+    }
+
+    #[test]
+    fn writer_send_after_close() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut sut = Writer::new(empty::<TestResponse>());
+
+        // Close the writer
+        let close_result = sut.poll_close_unpin(&mut cx);
+        assert_ready_ok!(close_result);
+
+        // Attempt operations after close
+        let ready_result = sut.poll_ready_unpin(&mut cx);
+        assert!(matches!(
+            assert_ready_err!(ready_result),
+            WriterError::Closed
+        ));
+
+        let send_result = sut.start_send_unpin(());
+        assert!(matches!(send_result.unwrap_err(), WriterError::Closed));
+    }
+
+    #[test]
+    fn writer_double_close() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut sut = Writer::new(empty::<TestResponse>());
+
+        // First close
+        let first_close = sut.poll_close_unpin(&mut cx);
+        assert_ready_ok!(first_close);
+
+        // Second close should return closed error
+        let second_close = sut.poll_close_unpin(&mut cx);
+        assert!(matches!(
+            assert_ready_err!(second_close),
+            WriterError::Closed
+        ));
     }
 }

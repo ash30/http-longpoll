@@ -252,6 +252,7 @@ dependencies = [
  "futures-util",
  "http-longpoll",
  "tokio",
+ "tokio-stream",
  "uuid7",
 ]
 
