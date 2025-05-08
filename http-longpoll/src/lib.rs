@@ -170,8 +170,6 @@ impl<T> SessionHandle<T> {
         let (tx, rx) = oneshot::channel();
         self.poll.send(tx).await.map_err(|_| SessionError::Closed)?;
 
-        // We can receive Closed channel error IFF client closes
-        // and there is no data to flush
         rx.await.map_err(|_| SessionError::Closed)?
     }
 }

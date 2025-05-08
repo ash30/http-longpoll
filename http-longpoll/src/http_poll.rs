@@ -169,10 +169,7 @@ where
     }
 }
 
-// you need x2 traits
-// one for length
-// oone for adding to existing
-
+// =================
 pub trait Appendable {
     fn len(&self) -> usize;
     fn append(&mut self, next: Self);
@@ -288,7 +285,13 @@ mod tests {
     use tokio_test::{assert_ok, assert_pending, assert_ready_err, assert_ready_ok};
 
     use super::{Callback, Writer, WriterError};
-    type TestResponse = Callback<Result<(), WriterError>>;
+    type TestResponse = Callback<Result<Option<()>, WriterError>>;
+
+    macro_rules! test_callback {
+        () => {
+            oneshot::channel::<Result<Option<()>, WriterError>>()
+        };
+    }
 
     #[test]
     fn writer_ready_no_poll_should_be_pending() {
@@ -303,7 +306,7 @@ mod tests {
     #[test]
     fn writer_ready() {
         let mut cx = Context::from_waker(noop_waker_ref());
-        let p1 = oneshot::channel::<Result<(), WriterError>>();
+        let p1 = test_callback!();
         let inner = stream::iter(vec![p1.0]);
 
         // should be ready
@@ -315,8 +318,8 @@ mod tests {
     #[test]
     fn writer_ready_double_poll() {
         let mut cx = Context::from_waker(noop_waker_ref());
-        let p1 = oneshot::channel::<Result<(), WriterError>>();
-        let p2 = oneshot::channel::<Result<(), WriterError>>();
+        let p1 = test_callback!();
+        let p2 = test_callback!();
         let inner = stream::iter(vec![p1.0, p2.0]);
 
         let mut sut = Writer::new(inner);
@@ -335,14 +338,14 @@ mod tests {
     #[test]
     fn writer_ready_double_poll_with_data() {
         let mut cx = Context::from_waker(noop_waker_ref());
-        let p1 = oneshot::channel::<Result<(), WriterError>>();
-        let p2 = oneshot::channel::<Result<(), WriterError>>();
+        let p1 = test_callback!();
+        let p2 = test_callback!();
         let inner = stream::iter(vec![p1.0, p2.0]);
 
         let mut sut = Writer::new(inner);
         assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
 
-        let send_result = sut.start_send_unpin(());
+        let send_result = sut.start_send_unpin(Some(()));
         assert_ok!(send_result, "send data");
 
         let result = sut.poll_ready_unpin(&mut cx);
@@ -361,14 +364,14 @@ mod tests {
     #[test]
     fn writer_close_with_pending_data() {
         let mut cx = Context::from_waker(noop_waker_ref());
-        let mut p1 = oneshot::channel::<Result<(), WriterError>>();
+        let mut p1 = test_callback!();
         let inner = stream::iter(vec![p1.0]);
 
         let mut sut = Writer::new(inner);
 
         // Send data but don't flush
         assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
-        assert_ok!(sut.start_send_unpin(()), "send data");
+        assert_ok!(sut.start_send_unpin(Some(())), "send data");
 
         // Close should try to flush pending data first
         let close_result = sut.poll_close_unpin(&mut cx);
@@ -382,7 +385,7 @@ mod tests {
     #[test]
     fn writer_close_during_active_poll() {
         let mut cx = Context::from_waker(noop_waker_ref());
-        let mut p1 = oneshot::channel::<Result<(), WriterError>>();
+        let mut p1 = test_callback!();
         let inner = stream::iter(vec![p1.0]);
 
         let mut sut = Writer::new(inner);
@@ -415,7 +418,7 @@ mod tests {
             WriterError::Closed
         ));
 
-        let send_result = sut.start_send_unpin(());
+        let send_result = sut.start_send_unpin(Some(()));
         assert!(matches!(send_result.unwrap_err(), WriterError::Closed));
     }
 
