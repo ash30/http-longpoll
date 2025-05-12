@@ -2,7 +2,7 @@ use futures::{Sink, Stream};
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{ready, Context, Poll, Waker};
 use tokio::sync::oneshot;
 
 pub type Callback<T> = oneshot::Sender<T>;
@@ -73,7 +73,6 @@ impl<S, T> Writer<S>
 where
     S: ResponseStream<Response = Result<T>>,
 {
-    // The idea is to only poll inner when no current poll or current poll + no data
     fn poll_inner(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let this = self.project();
         let (_, out) = is_open!(this.state);
@@ -186,6 +185,7 @@ pin_project! {
         pub inner: S,
         buf: VecDeque<T>,
         max_size:usize,
+        pending_idle: Option<Waker>
     }
 }
 
@@ -195,6 +195,7 @@ impl<S, T> ResponseFramer<S, T> {
             buf: VecDeque::new(),
             max_size,
             inner,
+            pending_idle: None,
         }
     }
 }
@@ -213,6 +214,7 @@ where
         if self.buf.is_empty() {
             self.as_mut().project().inner.poll_ready(cx)
         } else {
+            *self.project().pending_idle = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -222,8 +224,12 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), S::Error>> {
         loop {
+            dbg!();
             if self.buf.is_empty() {
                 // SAFE to call poll_connection_idle again
+                if let Some(w) = self.project().pending_idle.take() {
+                    w.wake();
+                }
                 return Poll::Ready(Ok(()));
             }
             ready!(self.as_mut().project().inner.poll_ready(cx))?;
