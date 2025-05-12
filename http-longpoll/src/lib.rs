@@ -266,7 +266,82 @@ pub mod axum {
 
 #[cfg(test)]
 mod tests {
+    use super::axum::*;
+    use super::Config;
 
-    #[test]
-    fn init() {}
+    use futures::task::noop_waker_ref;
+    use futures::Future;
+    use futures::Stream;
+    use std::task::Context;
+    use std::time::Duration;
+    use tokio_test::assert_pending;
+    use tokio_test::assert_ready;
+
+    #[tokio::test]
+    async fn test_session_timeout_no_idle() {
+        let config = Config {
+            poll_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let (mut handle, session) = Session::<Bytes>::connect(config);
+        tokio::pin!(session);
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        // Initially no message
+        // this should NOT trigger timeout, since no waiting poll req
+        assert_pending!(session.as_mut().poll_next(&mut cx));
+        assert_eq!(
+            session.timer_active, false,
+            "Timer should not be active when NO poll req"
+        );
+    }
+
+    // TODO: WE have to use tokio test because of sleep timer...
+    #[tokio::test]
+    async fn test_session_timeout_idle_conn() {
+        let config = Config {
+            poll_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let (mut handle, session) = Session::<Bytes>::connect(config);
+        tokio::pin!(session);
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        let poll_req = handle.poll();
+        tokio::pin!(poll_req);
+
+        // Should pend waiting for reply
+        assert_pending!(poll_req.poll(&mut cx));
+
+        // Active timer on msg poll
+        assert_pending!(session.as_mut().poll_next(&mut cx));
+        assert_eq!(session.timer_active, true, "Timer should be active");
+    }
+
+    #[tokio::test]
+    async fn test_session_timeout_idle_conn_flush() {
+        tokio::time::pause();
+        let config = Config {
+            poll_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let (mut handle, session) = Session::<Bytes>::connect(config);
+        tokio::pin!(session);
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        let poll_req = handle.poll();
+        tokio::pin!(poll_req);
+
+        assert_pending!(poll_req.as_mut().poll(&mut cx));
+        assert_pending!(session.as_mut().poll_next(&mut cx));
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+
+        session.poll_timer(
+            &mut cx,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        );
+
+        assert_ready!(poll_req.poll(&mut cx));
+    }
 }
