@@ -2,11 +2,17 @@
 
 mod http_poll;
 
-use futures::{Sink, SinkExt, Stream};
+use futures::{Future, Sink, SinkExt, Stream};
 use http_poll::{Appendable, ResponseFramer, ResultCallback, Writer, WriterError};
 use pin_project_lite::pin_project;
-use std::task::{ready, Poll};
-use tokio::sync::{mpsc, oneshot};
+use std::{
+    task::{ready, Poll},
+    time::Duration,
+};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::{Instant, Sleep},
+};
 use tokio_stream::wrappers::ReceiverStream;
 
 // API
@@ -14,6 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct Config {
     pub message_max_size: usize,
     pub request_capactiy: usize,
+    pub poll_timeout: Duration,
 }
 
 impl Default for Config {
@@ -21,6 +28,7 @@ impl Default for Config {
         Self {
             message_max_size: 1 << 20,
             request_capactiy: 16,
+            poll_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -30,7 +38,11 @@ pin_project! {
         #[pin]
         read: ReceiverStream<Result<T,()>>,
         #[pin]
-        write: ResponseFramer<Writer<ReceiverStream<ResultCallback<T>>>,T>
+        write: ResponseFramer<Writer<ReceiverStream<ResultCallback<T>>>,T>,
+        #[pin]
+        timer: Sleep,
+        duration: Duration,
+        timer_active: bool,
     }
 }
 
@@ -42,10 +54,14 @@ where
         read: ReceiverStream<Result<T, ()>>,
         write: ReceiverStream<ResultCallback<T>>,
         max_size: usize,
+        poll_timeout: Duration,
     ) -> Self {
         Self {
             read,
             write: ResponseFramer::new(max_size, Writer::new(write)),
+            timer: tokio::time::sleep(Duration::default()),
+            duration: poll_timeout,
+            timer_active: false,
         }
     }
 
@@ -58,15 +74,55 @@ where
 }
 
 // PROXY STREAM AND SINK
-impl<T> Stream for Session<T> {
+//
+impl<T> Session<T>
+where
+    T: Appendable,
+{
+    fn poll_timer(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        now: tokio::time::Instant,
+    ) {
+        if !self.timer_active
+            && self
+                .as_mut()
+                .project()
+                .write
+                .poll_connection_idle(cx)
+                .is_ready()
+        {
+            let this = self.as_mut().project();
+            *this.timer_active = true;
+            this.timer.reset(now + *this.duration);
+        }
+        if self.timer_active && self.as_mut().project().timer.poll(cx).is_ready() {
+            // timeout!
+            let this = self.as_mut().project();
+            *this.timer_active = false;
+            // THIS SHOULD NOT PEND!
+            // as we have idle connection ...
+            // TODO: what about errors ...
+            self.as_mut().start_send(T::unit());
+            self.as_mut().poll_flush(cx);
+        }
+    }
+}
+
+impl<T> Stream for Session<T>
+where
+    T: Appendable,
+{
     type Item = T;
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        // Start Idle connection timer if not active
+        self.as_mut().poll_timer(cx, Instant::now());
         match ready!(self.as_mut().project().read.poll_next(cx)) {
             // Client close signal
-            // YOU MUST Poll Stream to see client Closes...
+            // NOTE: YOU MUST Poll Stream to see client Closes...
             Some(Err(_)) => {
                 self.project().read.close();
                 Poll::Ready(None)
@@ -90,7 +146,9 @@ where
         self.project().write.poll_ready(cx)
     }
 
-    fn start_send(self: std::pin::Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+    fn start_send(mut self: std::pin::Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        // Disable idle timeout once we start sending
+        *self.as_mut().project().timer_active = false;
         self.project().write.start_send(item)
     }
 
@@ -125,6 +183,7 @@ where
                 ReceiverStream::new(m_rx),
                 ReceiverStream::new(p_rx),
                 config.message_max_size,
+                config.poll_timeout,
             ),
         )
     }
@@ -186,6 +245,9 @@ pub mod axum {
 
     // Allow common response types to be used
     impl Appendable for Bytes {
+        fn unit() -> Self {
+            Bytes::new()
+        }
         fn len(&self) -> usize {
             self.len()
         }
