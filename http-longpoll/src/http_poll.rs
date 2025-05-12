@@ -465,6 +465,7 @@ mod tests {
         use super::*;
         use futures::task::noop_waker_ref;
         use std::task::Context;
+        use tokio_stream::StreamExt;
         use tokio_test::{assert_pending, assert_ready_ok};
 
         #[derive(Debug)]
@@ -494,7 +495,7 @@ mod tests {
         fn test_poll_connection_idle_empty() {
             let mut cx = Context::from_waker(noop_waker_ref());
             let inner = Writer::new(stream::pending::<TestResponse>());
-            let mut framer = ResponseFramer::new(100, inner);
+            let framer = ResponseFramer::new(100, inner);
             pin_mut!(framer);
 
             // When buffer is empty, idle is pending
@@ -507,7 +508,7 @@ mod tests {
             let mut cx = Context::from_waker(noop_waker_ref());
             let p1 = test_callback!();
             let inner = Writer::new(stream::iter(vec![p1.0]));
-            let mut framer = ResponseFramer::new(100, inner);
+            let framer = ResponseFramer::new(100, inner);
             pin_mut!(framer);
 
             // When stream has item and buffer is empty, we
@@ -518,17 +519,47 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn test_poll_connection_idle_woken_on_flush() {
+            let p1 = test_callback!();
+            let inner = Writer::new(stream::iter(vec![p1.0]).chain(stream::pending()));
+            let framer = ResponseFramer::new(100, inner);
+
+            let mut task = tokio_test::task::spawn(framer);
+            assert_ready_ok!(
+                task.enter(|cx, f| f.poll_connection_idle(cx)),
+                "Should be ready when buffer empty and connection waiting"
+            );
+            assert_ok!(
+                task.enter(|_, f| f.start_send(TestData(10))),
+                "sending data"
+            );
+            assert_pending!(
+                task.enter(|cx, f| f.poll_connection_idle(cx)),
+                "Should be ready when buffer empty and connection waiting"
+            );
+            assert_ready_ok!(task.enter(|cx, f| f.poll_flush(cx)));
+
+            // clearing buffer should awaken idle conn poll
+            assert!(task.is_woken());
+
+            // AFTER FLUSH, We should be ready again
+            // TODO: need a bette way to control inner timing in order to test this...
+            // assert_ready_ok!(
+            //     task.enter(|cx, f| f.poll_connection_idle(cx)),
+            //     "Should be ready when buffer empty and connection waiting"
+            // );
+        }
+
         #[test]
         fn test_poll_connection_idle_poll_req_with_data() {
             let mut cx = Context::from_waker(noop_waker_ref());
             let p1 = test_callback!();
-            let inner = Writer::new(stream::iter(vec![p1.0]));
+            let inner = Writer::new(stream::iter(vec![p1.0]).chain(stream::pending()));
             let mut framer = ResponseFramer::new(100, inner);
             pin_mut!(framer);
 
             // When stream has item and buffer HAS DATA
-            //
-            // When buffer has data
             assert_ok!(framer.as_mut().start_send(TestData(10)), "sending data");
 
             let result = framer.as_mut().poll_connection_idle(&mut cx);
@@ -537,50 +568,5 @@ mod tests {
                 "Should be pending when connection waiting but buffer has data"
             );
         }
-
-        // // When buffer has data
-        // assert_ok!(framer.as_mut().start_send(TestData(10)), "sending data");
-        // let result = framer.as_mut().poll_connection_idle(&mut cx);
-        // assert_pending!(result, "Should be pending when buffer has data");
-
-        // // After flushing the buffer
-        // assert_ready_ok!(framer.as_mut().poll_flush(&mut cx), "flushing data");
-        // let result = framer.as_mut().poll_connection_idle(&mut cx);
-        // assert_ready_ok!(result, "Should be ready after buffer is flushed");
-
-        // // When connection is closed
-        // let closed_writer = Writer::new(empty::<TestResponse>());
-        // let mut closed_framer = ResponseFramer::new(100, closed_writer);
-        // pin_mut!(closed_framer);
-        // let result = closed_framer.as_mut().poll_connection_idle(&mut cx);
-        // assert_pending!(result, "Should be pending when no connection available");
-
-        // #[test]
-        // fn test_poll_connection_idle_with_multiple_messages() {
-        //     let mut cx = Context::from_waker(noop_waker_ref());
-        //     let p1 = test_callback!();
-        //     let inner = Writer::new(stream::iter(vec![p1.0]));
-        //     let mut framer = ResponseFramer::new(100, inner);
-        //     pin_mut!(framer);
-
-        //     // Buffer multiple messages
-        //     assert_ok!(
-        //         framer.as_mut().start_send(TestData(10)),
-        //         "sending first data"
-        //     );
-        //     assert_ok!(
-        //         framer.as_mut().start_send(TestData(20)),
-        //         "sending second data"
-        //     );
-
-        //     // Should be pending while buffer has data
-        //     let result = framer.as_mut().poll_connection_idle(&mut cx);
-        //     assert_pending!(result, "Should be pending with multiple messages in buffer");
-
-        //     // After flushing all messages
-        //     assert_ok!(framer.as_mut().poll_flush(&mut cx), "flushing data");
-        //     let result = framer.as_mut().poll_connection_idle(&mut cx);
-        //     assert_ready_ok!(result, "Should be ready after all messages are flushed");
-        // }
     }
 }
