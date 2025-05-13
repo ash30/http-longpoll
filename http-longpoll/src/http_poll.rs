@@ -111,8 +111,10 @@ where
         ready!(self.as_mut().poll_flush(cx))?;
 
         // explicitly drop 'out' request incase
-        let (next, out) = is_open!(self.as_mut().project().state);
-        let _ = out.take();
+        let (_, out) = is_open!(self.as_mut().project().state);
+        if let Some(out) = out.take() {
+            let _ = out.send(Err(WriterError::Closed));
+        }
 
         *(self.project().state) = WriterState::Closed(WriterError::Closed);
         Poll::Ready(Ok(()))
