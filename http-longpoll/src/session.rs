@@ -242,7 +242,7 @@ mod tests {
     use tokio_test::assert_ready;
 
     #[tokio::test]
-    async fn test_session_timeout_no_idle() {
+    async fn session_timeout_no_idle() {
         let config = Config {
             poll_timeout: Duration::from_secs(1),
             ..Default::default()
@@ -262,7 +262,7 @@ mod tests {
 
     // TODO: WE have to use tokio test because of sleep timer...
     #[tokio::test]
-    async fn test_session_timeout_idle_conn() {
+    async fn session_timeout_idle_conn() {
         let config = Config {
             poll_timeout: Duration::from_secs(1),
             ..Default::default()
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_timeout_idle_conn_flush() {
+    async fn session_timeout_idle_conn_flush() {
         tokio::time::pause();
         let config = Config {
             poll_timeout: Duration::from_millis(100),

@@ -297,7 +297,7 @@ where
 // =====
 //
 #[cfg(test)]
-mod tests {
+mod tests_writer {
     use futures::stream::empty;
     use futures::task::noop_waker_ref;
     use futures::{pin_mut, stream};
@@ -460,115 +460,116 @@ mod tests {
             WriterError::Closed
         ));
     }
+}
 
-    // [cfg(test)]
-    mod response_framer_tests {
-        use super::super::*;
-        use super::*;
-        use futures::task::noop_waker_ref;
-        use std::task::Context;
-        use tokio_stream::StreamExt;
-        use tokio_test::{assert_pending, assert_ready_ok};
+#[cfg(test)]
+mod test_response_framer {
+    use super::*;
+    use futures::task::noop_waker_ref;
+    use futures::{pin_mut, stream};
+    use std::task::Context;
+    use tokio::sync::oneshot;
+    use tokio_stream::StreamExt;
+    use tokio_test::{assert_ok, assert_pending, assert_ready_ok};
 
-        #[derive(Debug)]
-        struct TestData(usize);
+    #[derive(Debug)]
+    struct TestData(usize);
 
-        impl Appendable for TestData {
-            fn len(&self) -> usize {
-                self.0
-            }
-
-            fn append(&mut self, next: Self) {
-                self.0 += next.0;
-            }
-
-            fn unit() -> Self {
-                TestData(0)
-            }
-        }
-        macro_rules! test_callback {
-            () => {
-                oneshot::channel::<std::result::Result<TestData, WriterError>>()
-            };
-        }
-        type TestResponse = Callback<Result<TestData>>;
-
-        #[test]
-        fn test_poll_connection_idle_empty() {
-            let mut cx = Context::from_waker(noop_waker_ref());
-            let inner = Writer::new(stream::pending::<TestResponse>());
-            let framer = ResponseFramer::new(100, inner);
-            pin_mut!(framer);
-
-            // When buffer is empty, idle is pending
-            let result = framer.as_mut().poll_connection_idle(&mut cx);
-            assert_pending!(result, "Should be pending when buffer empty");
+    impl Appendable for TestData {
+        fn len(&self) -> usize {
+            self.0
         }
 
-        #[test]
-        fn test_poll_connection_idle_poll_req_with_no_data() {
-            let mut cx = Context::from_waker(noop_waker_ref());
-            let p1 = test_callback!();
-            let inner = Writer::new(stream::iter(vec![p1.0]));
-            let framer = ResponseFramer::new(100, inner);
-            pin_mut!(framer);
-
-            // When stream has item and buffer is empty, we
-            let result = framer.as_mut().poll_connection_idle(&mut cx);
-            assert_ready_ok!(
-                result,
-                "Should be ready when buffer empty and connection waiting"
-            );
+        fn append(&mut self, next: Self) {
+            self.0 += next.0;
         }
 
-        #[tokio::test]
-        async fn test_poll_connection_idle_woken_on_flush() {
-            let p1 = test_callback!();
-            let inner = Writer::new(stream::iter(vec![p1.0]).chain(stream::pending()));
-            let framer = ResponseFramer::new(100, inner);
-
-            let mut task = tokio_test::task::spawn(framer);
-            assert_ready_ok!(
-                task.enter(|cx, f| f.poll_connection_idle(cx)),
-                "Should be ready when buffer empty and connection waiting"
-            );
-            assert_ok!(
-                task.enter(|_, f| f.start_send(TestData(10))),
-                "sending data"
-            );
-            assert_pending!(
-                task.enter(|cx, f| f.poll_connection_idle(cx)),
-                "Should be ready when buffer empty and connection waiting"
-            );
-            assert_ready_ok!(task.enter(|cx, f| f.poll_flush(cx)));
-
-            // clearing buffer should awaken idle conn poll
-            assert!(task.is_woken());
-
-            // AFTER FLUSH, We should be ready again
-            // TODO: need a bette way to control inner timing in order to test this...
-            // assert_ready_ok!(
-            //     task.enter(|cx, f| f.poll_connection_idle(cx)),
-            //     "Should be ready when buffer empty and connection waiting"
-            // );
+        fn unit() -> Self {
+            TestData(0)
         }
+    }
+    macro_rules! test_callback {
+        () => {
+            oneshot::channel::<std::result::Result<TestData, WriterError>>()
+        };
+    }
+    type TestResponse = Callback<Result<TestData>>;
 
-        #[test]
-        fn test_poll_connection_idle_poll_req_with_data() {
-            let mut cx = Context::from_waker(noop_waker_ref());
-            let p1 = test_callback!();
-            let inner = Writer::new(stream::iter(vec![p1.0]).chain(stream::pending()));
-            let mut framer = ResponseFramer::new(100, inner);
-            pin_mut!(framer);
+    #[test]
+    fn poll_connection_idle_empty() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let inner = Writer::new(stream::pending::<TestResponse>());
+        let framer = ResponseFramer::new(100, inner);
+        pin_mut!(framer);
 
-            // When stream has item and buffer HAS DATA
-            assert_ok!(framer.as_mut().start_send(TestData(10)), "sending data");
+        // When buffer is empty, idle is pending
+        let result = framer.as_mut().poll_connection_idle(&mut cx);
+        assert_pending!(result, "Should be pending when buffer empty");
+    }
 
-            let result = framer.as_mut().poll_connection_idle(&mut cx);
-            assert_pending!(
-                result,
-                "Should be pending when connection waiting but buffer has data"
-            );
-        }
+    #[test]
+    fn poll_connection_idle_poll_req_with_no_data() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let p1 = test_callback!();
+        let inner = Writer::new(stream::iter(vec![p1.0]));
+        let framer = ResponseFramer::new(100, inner);
+        pin_mut!(framer);
+
+        // When stream has item and buffer is empty, we
+        let result = framer.as_mut().poll_connection_idle(&mut cx);
+        assert_ready_ok!(
+            result,
+            "Should be ready when buffer empty and connection waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_connection_idle_woken_on_flush() {
+        let p1 = test_callback!();
+        let inner = Writer::new(stream::iter(vec![p1.0]).chain(stream::pending()));
+        let framer = ResponseFramer::new(100, inner);
+
+        let mut task = tokio_test::task::spawn(framer);
+        assert_ready_ok!(
+            task.enter(|cx, f| f.poll_connection_idle(cx)),
+            "Should be ready when buffer empty and connection waiting"
+        );
+        assert_ok!(
+            task.enter(|_, f| f.start_send(TestData(10))),
+            "sending data"
+        );
+        assert_pending!(
+            task.enter(|cx, f| f.poll_connection_idle(cx)),
+            "Should be ready when buffer empty and connection waiting"
+        );
+        assert_ready_ok!(task.enter(|cx, f| f.poll_flush(cx)));
+
+        // clearing buffer should awaken idle conn poll
+        assert!(task.is_woken());
+
+        // AFTER FLUSH, We should be ready again
+        // TODO: need a bette way to control inner timing in order to test this...
+        // assert_ready_ok!(
+        //     task.enter(|cx, f| f.poll_connection_idle(cx)),
+        //     "Should be ready when buffer empty and connection waiting"
+        // );
+    }
+
+    #[test]
+    fn poll_connection_idle_poll_req_with_data() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let p1 = test_callback!();
+        let inner = Writer::new(stream::iter(vec![p1.0]).chain(stream::pending()));
+        let mut framer = ResponseFramer::new(100, inner);
+        pin_mut!(framer);
+
+        // When stream has item and buffer HAS DATA
+        assert_ok!(framer.as_mut().start_send(TestData(10)), "sending data");
+
+        let result = framer.as_mut().poll_connection_idle(&mut cx);
+        assert_pending!(
+            result,
+            "Should be pending when connection waiting but buffer has data"
+        );
     }
 }
