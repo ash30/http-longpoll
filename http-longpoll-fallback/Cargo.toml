@@ -1,5 +1,5 @@
 [package]
-name = "axum-eio"
+name = "http-longpoll-fallback"
 version = "0.1.0"
 edition = "2021"
 

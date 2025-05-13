@@ -113,10 +113,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum-eio"
-version = "0.1.0"
-
-[[package]]
 name = "axum-extra"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -505,6 +501,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid7",
 ]
+
+[[package]]
+name = "http-longpoll-fallback"
+version = "0.1.0"
 
 [[package]]
 name = "http-range-header"
