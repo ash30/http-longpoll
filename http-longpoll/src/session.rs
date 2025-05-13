@@ -247,15 +247,15 @@ mod tests {
             poll_timeout: Duration::from_secs(1),
             ..Default::default()
         };
-        let (mut handle, session) = Session::<Bytes>::connect(config);
+        let (_, session) = Session::<Bytes>::connect(config);
         tokio::pin!(session);
         let mut cx = Context::from_waker(noop_waker_ref());
 
         // Initially no message
         // this should NOT trigger timeout, since no waiting poll req
         assert_pending!(session.as_mut().poll_next(&mut cx));
-        assert_eq!(
-            session.timer_active, false,
+        assert!(
+            !session.timer_active,
             "Timer should not be active when NO poll req"
         );
     }
@@ -279,7 +279,7 @@ mod tests {
 
         // Active timer on msg poll
         assert_pending!(session.as_mut().poll_next(&mut cx));
-        assert_eq!(session.timer_active, true, "Timer should be active");
+        assert!(session.timer_active, "Timer should be active");
     }
 
     #[tokio::test]
