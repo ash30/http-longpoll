@@ -171,18 +171,16 @@ where
 }
 
 // =================
-pub trait Appendable {
-    fn len(&self) -> usize;
-    fn append(&mut self, next: Self);
-    fn unit() -> Self;
+pub type TotalSize = usize;
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+pub trait Foldable: Default {
+    type Start: Default;
+    fn append(current: &mut Self::Start, value: Self) -> TotalSize;
 }
 
 pin_project! {
-    pub struct ResponseFramer<S,T>  {
+    pub struct ResponseFramer<S,T>
+    {
         #[pin]
         pub inner: S,
         buf: VecDeque<T>,
@@ -204,8 +202,8 @@ impl<S, T> ResponseFramer<S, T> {
 
 impl<S, T> ResponseFramer<S, T>
 where
-    T: Appendable,
-    S: Sink<T>,
+    T: Foldable,
+    S: Sink<T::Start>,
 {
     pub fn poll_connection_idle(
         mut self: Pin<&mut Self>,
@@ -236,17 +234,17 @@ where
             }
             ready!(self.as_mut().project().inner.poll_ready(cx))?;
             let this = self.as_mut().project();
-            let mut value = this.buf.pop_front().unwrap();
+            let mut start = T::Start::default();
             loop {
                 if this.buf.is_empty() {
                     break;
                 }
-                if value.len() + this.buf.front().unwrap().len() > *this.max_size {
+                let mut value = this.buf.pop_front().unwrap();
+                if T::append(&mut start, value) > *this.max_size {
                     break;
                 }
-                value.append(this.buf.pop_front().unwrap())
             }
-            if let Err(e) = this.inner.start_send(value) {
+            if let Err(e) = this.inner.start_send(start) {
                 return Poll::Ready(Err(e));
             };
         }
@@ -255,8 +253,8 @@ where
 
 impl<S, T> Sink<T> for ResponseFramer<S, T>
 where
-    S: Sink<T>,
-    T: Appendable,
+    S: Sink<T::Start>,
+    T: Foldable,
 {
     type Error = S::Error;
 
@@ -472,22 +470,17 @@ mod test_response_framer {
     use tokio_stream::StreamExt;
     use tokio_test::{assert_ok, assert_pending, assert_ready_ok};
 
-    #[derive(Debug)]
-    struct TestData(usize);
+    #[derive(Debug, Default)]
+    struct TestData(());
 
-    impl Appendable for TestData {
-        fn len(&self) -> usize {
-            self.0
-        }
+    impl Foldable for TestData {
+        type Start = Self;
 
-        fn append(&mut self, next: Self) {
-            self.0 += next.0;
-        }
-
-        fn unit() -> Self {
-            TestData(0)
+        fn append(current: &mut Self::Start, value: Self) -> TotalSize {
+            0
         }
     }
+
     macro_rules! test_callback {
         () => {
             oneshot::channel::<std::result::Result<TestData, WriterError>>()
@@ -499,7 +492,7 @@ mod test_response_framer {
     fn poll_connection_idle_empty() {
         let mut cx = Context::from_waker(noop_waker_ref());
         let inner = Writer::new(stream::pending::<TestResponse>());
-        let framer = ResponseFramer::new(100, inner);
+        let framer = ResponseFramer::<_, TestData>::new(100, inner);
         pin_mut!(framer);
 
         // When buffer is empty, idle is pending
@@ -512,7 +505,7 @@ mod test_response_framer {
         let mut cx = Context::from_waker(noop_waker_ref());
         let p1 = test_callback!();
         let inner = Writer::new(stream::iter(vec![p1.0]));
-        let framer = ResponseFramer::new(100, inner);
+        let framer = ResponseFramer::<_, TestData>::new(100, inner);
         pin_mut!(framer);
 
         // When stream has item and buffer is empty, we
@@ -535,7 +528,7 @@ mod test_response_framer {
             "Should be ready when buffer empty and connection waiting"
         );
         assert_ok!(
-            task.enter(|_, f| f.start_send(TestData(10))),
+            task.enter(|_, f| f.start_send(TestData(()))),
             "sending data"
         );
         assert_pending!(
@@ -560,11 +553,11 @@ mod test_response_framer {
         let mut cx = Context::from_waker(noop_waker_ref());
         let p1 = test_callback!();
         let inner = Writer::new(stream::iter(vec![p1.0]).chain(stream::pending()));
-        let mut framer = ResponseFramer::new(100, inner);
+        let framer = ResponseFramer::new(100, inner);
         pin_mut!(framer);
 
         // When stream has item and buffer HAS DATA
-        assert_ok!(framer.as_mut().start_send(TestData(10)), "sending data");
+        assert_ok!(framer.as_mut().start_send(TestData(())), "sending data");
 
         let result = framer.as_mut().poll_connection_idle(&mut cx);
         assert_pending!(

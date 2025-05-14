@@ -1,4 +1,4 @@
-use crate::http_poll::{Appendable, ResponseFramer, ResultCallback, Writer, WriterError};
+use crate::http_poll::{Foldable, ResponseFramer, ResultCallback, Writer, WriterError};
 use futures::{Future, Sink, SinkExt, Stream};
 use pin_project_lite::pin_project;
 use std::{
@@ -31,11 +31,11 @@ impl Default for Config {
 }
 
 pin_project! {
-    pub struct Session<T>{
+    pub struct Session<T> where T:Foldable {
         #[pin]
         read: ReceiverStream<Result<T,()>>,
         #[pin]
-        write: ResponseFramer<Writer<ReceiverStream<ResultCallback<T>>>,T>,
+        write: ResponseFramer<Writer<ReceiverStream<ResultCallback<T::Start>>>,T>,
         #[pin]
         timer: Sleep,
         duration: Duration,
@@ -45,11 +45,11 @@ pin_project! {
 
 impl<T> Session<T>
 where
-    T: Appendable,
+    T: Foldable,
 {
     fn new(
         read: ReceiverStream<Result<T, ()>>,
-        write: ReceiverStream<ResultCallback<T>>,
+        write: ReceiverStream<ResultCallback<T::Start>>,
         max_size: usize,
         poll_timeout: Duration,
     ) -> Self {
@@ -74,7 +74,7 @@ where
 //
 impl<T> Session<T>
 where
-    T: Appendable,
+    T: Foldable,
 {
     fn poll_timer(
         mut self: std::pin::Pin<&mut Self>,
@@ -100,7 +100,7 @@ where
             // THIS SHOULD NOT PEND!
             // as we have idle connection ...
             // TODO: what about errors ...
-            self.as_mut().start_send(T::unit());
+            self.as_mut().start_send(T::default());
             self.as_mut().poll_flush(cx);
         }
     }
@@ -108,7 +108,7 @@ where
 
 impl<T> Stream for Session<T>
 where
-    T: Appendable,
+    T: Foldable,
 {
     type Item = T;
     fn poll_next(
@@ -132,7 +132,7 @@ where
 
 impl<T> Sink<T> for Session<T>
 where
-    T: Appendable,
+    T: Foldable,
 {
     type Error = WriterError;
 
@@ -166,7 +166,7 @@ where
 
 impl<T> Session<T>
 where
-    T: Appendable,
+    T: Foldable,
 {
     pub fn connect(config: Config) -> (SessionHandle<T>, Session<T>) {
         let (p_tx, p_rx) = mpsc::channel(config.request_capactiy);
@@ -187,13 +187,19 @@ where
 }
 
 #[derive(Debug)]
-pub struct SessionHandle<T> {
+pub struct SessionHandle<T>
+where
+    T: Foldable,
+{
     msg: mpsc::Sender<Result<T, ()>>,
-    poll: mpsc::Sender<ResultCallback<T>>,
+    poll: mpsc::Sender<ResultCallback<T::Start>>,
 }
 
 // Implement Clone manually to avoid B affecting derive
-impl<T> Clone for SessionHandle<T> {
+impl<T> Clone for SessionHandle<T>
+where
+    T: Foldable,
+{
     fn clone(&self) -> Self {
         Self {
             msg: self.msg.clone(),
@@ -202,7 +208,10 @@ impl<T> Clone for SessionHandle<T> {
     }
 }
 
-impl<T> SessionHandle<T> {
+impl<T> SessionHandle<T>
+where
+    T: Foldable,
+{
     pub async fn close(&mut self) -> Result<(), SessionError> {
         // We send a ERR down to session (client code might need to timeout this op ?)
         // Client can choose to drain remaining message or DROP handle
@@ -220,7 +229,7 @@ impl<T> SessionHandle<T> {
             .map_err(|_| SessionError::Closed)
     }
 
-    pub async fn poll(&mut self) -> Result<T, SessionError> {
+    pub async fn poll(&mut self) -> Result<T::Start, SessionError> {
         let (tx, rx) = oneshot::channel();
         self.poll.send(tx).await.map_err(|_| SessionError::Closed)?;
 
@@ -247,7 +256,7 @@ mod tests {
             poll_timeout: Duration::from_secs(1),
             ..Default::default()
         };
-        let (_, session) = Session::<Bytes>::connect(config);
+        let (handle, session) = Session::<Bytes>::connect(config);
         tokio::pin!(session);
         let mut cx = Context::from_waker(noop_waker_ref());
 
