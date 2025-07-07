@@ -1,6 +1,6 @@
 use crate::http_poll::Foldable;
 
-//#[cfg(feature = "axum")]
+#[cfg(feature = "axum")]
 pub mod axum {
     use crate::http_poll::{Foldable, TotalSize};
     use crate::session::{self};
