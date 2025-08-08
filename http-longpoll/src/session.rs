@@ -100,8 +100,8 @@ where
             // THIS SHOULD NOT PEND!
             // as we have idle connection ...
             // TODO: what about errors ...
-            self.as_mut().start_send(T::default());
-            self.as_mut().poll_flush(cx);
+            let _ = self.as_mut().start_send(T::default());
+            let _ = self.as_mut().poll_flush(cx);
         }
     }
 }

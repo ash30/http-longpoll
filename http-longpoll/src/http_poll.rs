@@ -239,7 +239,7 @@ where
                 if this.buf.is_empty() {
                     break;
                 }
-                let mut value = this.buf.pop_front().unwrap();
+                let value = this.buf.pop_front().unwrap();
                 if T::append(&mut start, value) > *this.max_size {
                     break;
                 }
