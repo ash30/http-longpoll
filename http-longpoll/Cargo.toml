@@ -1,14 +1,18 @@
 [package]
 name = "http-longpoll"
-version = "0.1.0"
+license = "Apache-2.0"
+version = "0.1.0-rc.1"
 edition = "2021"
+keywords = ["http", "networking"]
+repository = "https://github.com/ash30/http-longpoll"
+description = "Idiomatic stream + sink interface for http longpoll"
 
 [features]
 default = ["axum"]
 axum = ["dep:axum"]
 
 [dependencies]
-axum = { version = "0.8.1", features = ["macros", "ws"] , optional = true}
+axum = { version = "0.8.1", features = ["macros"] , optional = true}
 bytes = "1.10.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
