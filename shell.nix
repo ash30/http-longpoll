@@ -24,6 +24,7 @@ pkgs.mkShell {
     cargo
   ];
   buildInputs = [
+    pkgs.cargo-release
     pkgs.rust-bin.stable.latest.rust-analyzer # LSP Server
     pkgs.rust-bin.stable.latest.rustfmt       # Formatter
     pkgs.rust-bin.stable.latest.clippy        # Linter
