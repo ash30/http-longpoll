@@ -25,6 +25,7 @@ pub mod axum {
         fn into_response(self) -> axum::response::Response {
             match self {
                 Self::PollingError => StatusCode::BAD_REQUEST.into_response(),
+                Self::PollingTimeout => StatusCode::OK.into_response(),
                 Self::Closed => StatusCode::GONE.into_response(),
             }
         }

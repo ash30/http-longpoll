@@ -1,14 +1,12 @@
 use crate::http_poll::{Foldable, ResponseFramer, ResultCallback, Writer, WriterError};
 use futures::{Future, Sink, SinkExt, Stream};
 use pin_project_lite::pin_project;
+use std::pin::Pin;
 use std::{
     task::{ready, Poll},
     time::Duration,
 };
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::{Instant, Sleep},
-};
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub type SessionError = WriterError;
@@ -36,10 +34,6 @@ pin_project! {
         read: ReceiverStream<Result<T,()>>,
         #[pin]
         write: ResponseFramer<Writer<ReceiverStream<ResultCallback<T::Start>>>,T>,
-        #[pin]
-        timer: Sleep,
-        duration: Duration,
-        timer_active: bool,
     }
 }
 
@@ -56,55 +50,19 @@ where
         Self {
             read,
             write: ResponseFramer::new(max_size, Writer::new(write)),
-            timer: tokio::time::sleep(Duration::default()),
-            duration: poll_timeout,
-            timer_active: false,
         }
     }
 
-    pub async fn close(&mut self) -> Result<(), SessionError> {
+    pub async fn close_session(mut self: Pin<&mut Self>) -> Result<(), SessionError> {
         // Close read, and then poll write for flush + close
         // calling code should drain session stream as well
-        self.read.close();
-        self.write.close().await
+        self.as_mut().project().read.close();
+        self.project().write.close().await
     }
 }
 
 // PROXY STREAM AND SINK
 //
-impl<T> Session<T>
-where
-    T: Foldable,
-{
-    fn poll_timer(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        now: tokio::time::Instant,
-    ) {
-        if !self.timer_active
-            && self
-                .as_mut()
-                .project()
-                .write
-                .poll_connection_idle(cx)
-                .is_ready()
-        {
-            let this = self.as_mut().project();
-            *this.timer_active = true;
-            this.timer.reset(now + *this.duration);
-        }
-        if self.timer_active && self.as_mut().project().timer.poll(cx).is_ready() {
-            // timeout!
-            let this = self.as_mut().project();
-            *this.timer_active = false;
-            // THIS SHOULD NOT PEND!
-            // as we have idle connection ...
-            // TODO: what about errors ...
-            let _ = self.as_mut().start_send(T::default());
-            let _ = self.as_mut().poll_flush(cx);
-        }
-    }
-}
 
 impl<T> Stream for Session<T>
 where
@@ -115,11 +73,14 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // Start Idle connection timer if not active
-        self.as_mut().poll_timer(cx, Instant::now());
+        //
+        // Close reader stream so eventually stream finishes
+        if let Poll::Ready(result) = self.as_mut().project().write.poll(cx) {
+            // what todo about error ?
+            self.as_mut().project().read.close();
+        }
+
         match ready!(self.as_mut().project().read.poll_next(cx)) {
-            // Client close signal
-            // NOTE: YOU MUST Poll Stream to see client Closes...
             Some(Err(_)) => {
                 self.project().read.close();
                 Poll::Ready(None)
@@ -144,8 +105,6 @@ where
     }
 
     fn start_send(mut self: std::pin::Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
-        // Disable idle timeout once we start sending
-        *self.as_mut().project().timer_active = false;
         self.project().write.start_send(item)
     }
 
@@ -263,10 +222,6 @@ mod tests {
         // Initially no message
         // this should NOT trigger timeout, since no waiting poll req
         assert_pending!(session.as_mut().poll_next(&mut cx));
-        assert!(
-            !session.timer_active,
-            "Timer should not be active when NO poll req"
-        );
     }
 
     // TODO: WE have to use tokio test because of sleep timer...
@@ -288,7 +243,6 @@ mod tests {
 
         // Active timer on msg poll
         assert_pending!(session.as_mut().poll_next(&mut cx));
-        assert!(session.timer_active, "Timer should be active");
     }
 
     #[tokio::test]
@@ -309,11 +263,6 @@ mod tests {
         assert_pending!(session.as_mut().poll_next(&mut cx));
 
         tokio::time::advance(Duration::from_millis(200)).await;
-
-        session.poll_timer(
-            &mut cx,
-            tokio::time::Instant::now() + Duration::from_secs(2),
-        );
 
         assert_ready!(poll_req.poll(&mut cx));
     }
