@@ -1,4 +1,4 @@
-use futures::{Future, Sink, Stream};
+use futures::{Future, Sink, SinkExt, Stream};
 use pin_project_lite::pin_project;
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -23,21 +23,12 @@ where
     type Response = U;
 }
 
-pin_project! {
-    pub struct Writer<S> where S:ResponseStream{
-        #[pin]
-        timer: Sleep,
-        #[pin]
-        stream:S,
-        state: WriterState<S::Response>,
-    }
-}
-
-enum WriterState<T> {
+#[derive(Debug)]
+enum WriterState<U> {
     Open {
         since: Instant,
-        buf: Option<T>,
-        out: Option<Callback<T>>,
+        buf: usize,
+        out: Option<U>,
     },
     Waiting {
         since: Instant,
@@ -47,13 +38,8 @@ enum WriterState<T> {
 }
 
 enum WriterEvent {
-    Closed(Result<()>),
+    Closed,
     Wait(Option<Instant>),
-}
-impl From<Result<()>> for WriterEvent {
-    fn from(value: Result<()>) -> Self {
-        Self::Closed(value)
-    }
 }
 impl From<Option<Instant>> for WriterEvent {
     fn from(value: Option<Instant>) -> Self {
@@ -61,102 +47,124 @@ impl From<Option<Instant>> for WriterEvent {
     }
 }
 
-impl<T> WriterState<T> {
+impl<U> WriterState<U> {
     fn new(now: Instant) -> Self {
         Self::Waiting {
             since: now,
             waker: None,
         }
     }
-}
-impl<T> WriterState<Result<T>> {
-    fn close(&mut self) {
+
+    fn send(&mut self) -> std::result::Result<(), WriterError> {
         match self {
-            Self::Closed => {}
+            Self::Closed => Err(WriterError::PollingError),
+            Self::Waiting { .. } => Err(WriterError::PollingError),
+            Self::Open { buf, .. } if *buf == 0 => {
+                *buf += 1;
+                Ok(())
+            }
+            Self::Open { .. } => Err(WriterError::PollingError),
+        }
+    }
+
+    fn flush(&mut self, now: Instant) -> std::result::Result<Option<U>, WriterError> {
+        match self {
+            Self::Closed => Err(WriterError::Closed),
+            Self::Waiting { .. } => Ok(None),
+            Self::Open { out, .. } => {
+                let current_req = out.take().unwrap();
+                *(self) = WriterState::Waiting {
+                    since: now,
+                    waker: None,
+                };
+                Ok(Some(current_req))
+            }
+        }
+    }
+
+    fn close(&mut self) -> Option<U> {
+        match self {
+            Self::Closed => None,
             Self::Waiting { waker, .. } => {
                 if let Some(w) = waker.take() {
                     w.wake_by_ref()
                 }
                 *(self) = WriterState::Closed;
+                None
             }
             Self::Open { out, .. } => {
                 let current_req = out.take().unwrap();
-                let _ = current_req.send(Err(WriterError::Closed));
                 *(self) = WriterState::Closed;
+                Some(current_req)
             }
         }
     }
 
     fn do_io(
         &mut self,
-        item: Poll<Option<Callback<Result<T>>>>,
+        item: Poll<Option<U>>,
         now: time::Instant,
-    ) -> WriterEvent {
+    ) -> std::result::Result<WriterEvent, WriterError> {
         match self {
             Self::Open { since, buf, out } => {
                 match item {
                     Poll::Pending => {
                         // TODO: CONFIG PLEASE
                         let since = *since;
-                        if now > since + Duration::from_secs(60) && buf.is_none() {
-                            let current_req = out.take().unwrap();
-                            *(self) = WriterState::Waiting {
-                                since: now,
-                                waker: None,
-                            };
-                            if let Err(_) = current_req.send(Err(WriterError::PollingTimeout)) {
-                                *(self) = WriterState::Closed;
-                                return Err(WriterError::PollingError).into();
-                            }
+                        if now > since + Duration::from_secs(60) && *buf > 0 {
+                            // Return PollingTimeout error - let caller handle callback
+                            return Err(WriterError::PollingTimeout);
                         }
-                        WriterEvent::Wait(Some(since + Duration::from_secs(60)))
+                        Ok(WriterEvent::Wait(Some(since + Duration::from_secs(60))))
                     }
                     Poll::Ready(Some(req)) => {
-                        // Error !
-                        let current_req = out.take().unwrap();
-                        let _ = current_req.send(Err(WriterError::PollingError));
-                        let _ = req.send(Err(WriterError::PollingError));
-                        Err(WriterError::PollingError).into()
+                        // Multiple requests - this is an error condition
+                        out.replace(req); // Store the new callback but return error
+                        Err(WriterError::PollingError)
                     }
                     Poll::Ready(None) => {
+                        // Stream closed gracefully
                         *(self) = WriterState::Closed;
-                        Ok(()).into()
+                        Ok(WriterEvent::Closed)
                     }
                 }
             }
-            Self::Waiting { since, waker } => match item {
-                Poll::Pending => {
-                    // Close if we haven't been polled for a while
-                    if now > *since + Duration::from_secs(60) {
-                        if let Some(w) = waker.take() {
-                            w.wake()
-                        }
-                        return Err(WriterError::PollingError).into();
-                    } else {
-                        WriterEvent::Wait(Some(*since + Duration::from_secs(60)))
+            Self::Waiting { since, waker } => {
+                if now > *since + Duration::from_secs(60) {
+                    return Err(WriterError::PollingError);
+                };
+                if let Some(w) = waker.take() {
+                    w.wake()
+                }
+                match item {
+                    Poll::Pending => Ok(WriterEvent::Wait(Some(*since + Duration::from_secs(60)))),
+                    Poll::Ready(Some(req)) => {
+                        *(self) = WriterState::Open {
+                            since: now,
+                            buf: 0,
+                            out: Some(req),
+                        };
+                        Ok(WriterEvent::Wait(None))
+                    }
+                    Poll::Ready(None) => {
+                        *(self) = WriterState::Closed;
+                        Ok(WriterEvent::Closed)
                     }
                 }
-                Poll::Ready(Some(req)) => {
-                    if let Some(w) = waker.take() {
-                        w.wake()
-                    }
-                    *(self) = WriterState::Open {
-                        since: now,
-                        buf: None,
-                        out: Some(req),
-                    };
-                    WriterEvent::Wait(None)
-                }
-                Poll::Ready(None) => {
-                    if let Some(w) = waker.take() {
-                        w.wake()
-                    }
-                    *(self) = WriterState::Closed;
-                    Ok(()).into()
-                }
-            },
-            Self::Closed => Ok(()).into(),
+            }
+            Self::Closed => Ok(WriterEvent::Closed),
         }
+    }
+}
+
+pin_project! {
+    pub struct Writer<S> where S:ResponseStream{
+        #[pin]
+        timer: Sleep,
+        #[pin]
+        stream:S,
+        state: WriterState<Callback<S::Response>>,
+        buf: Option<S::Response>,
     }
 }
 
@@ -166,9 +174,10 @@ where
 {
     pub fn new(stream: S) -> Self {
         Self {
-            state: WriterState::<S::Response>::new(Instant::now()),
+            state: WriterState::<Callback<S::Response>>::new(Instant::now()),
             stream,
             timer: tokio::time::sleep(Duration::default()),
+            buf: None,
         }
     }
 }
@@ -181,18 +190,6 @@ pub enum WriterError {
     PollingTimeout,
 }
 
-// SO WRITER needs a closed state because :
-// we need to signal to writer interface, potentially in separate task
-// POLL errors wouldn't close the channel
-// ALSO by only accepting streams, we don't have access to close method
-// NOW we can actually close things!
-
-// The futre returns §
-//
-// WE keep the state design because SINK interface won't poll stream directly
-// and needs to know if its closed already?
-//
-
 impl<S, T> Future for Writer<S>
 where
     S: ResponseStream<Response = Result<T>>,
@@ -203,13 +200,21 @@ where
         loop {
             let this = self.as_mut().project();
             match this.state.do_io(this.stream.poll_next(cx), Instant::now()) {
-                WriterEvent::Closed(res) => return Poll::Ready(res),
-                WriterEvent::Wait(Some(deadline)) => {
+                Ok(WriterEvent::Closed) => return Poll::Ready(Ok(())),
+                Ok(WriterEvent::Wait(Some(deadline))) => {
                     this.timer.reset(deadline.into());
-                    self.as_mut().project().timer.poll(cx);
+                    let _ = self.as_mut().project().timer.poll(cx);
                     return Poll::Pending;
                 }
-                WriterEvent::Wait(None) => continue,
+                Ok(WriterEvent::Wait(None)) => continue,
+                Err(error) => {
+                    // Handle the error by sending it to any active callback and closing
+                    let callback = self.as_mut().project().state.close();
+                    if let Some(callback) = callback {
+                        let _ = callback.send(Err(error));
+                    }
+                    return Poll::Ready(Err(error));
+                }
             }
         }
     }
@@ -225,6 +230,7 @@ where
 
     // We are ready when we have an active polling req waiting
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // flush existing
         ready!(self.as_mut().poll_flush(cx))?;
         match self.as_mut().project().state {
             WriterState::Closed => Poll::Ready(Err(WriterError::Closed)),
@@ -237,45 +243,39 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: T) -> Result<()> {
-        match self.as_mut().project().state {
-            WriterState::Closed => Err(WriterError::Closed),
-            WriterState::Waiting { waker, .. } => Err(WriterError::PollingError),
-            WriterState::Open { ref mut buf, .. } => {
-                // we silently overwrite here...
-                buf.replace(Ok(item));
-                Ok(())
-            }
-        }
+        let this = self.as_mut().project();
+        this.state.send()?;
+        this.buf.replace(Ok(item));
+        Ok(())
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        self.as_mut().project().state.close();
+        let callback = self.as_mut().project().state.close();
+        if let Some(callback) = callback {
+            let _ = callback.send(Err(WriterError::Closed));
+        }
         Poll::Ready(Ok(()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        match self.as_mut().project().state {
-            WriterState::Closed => return Poll::Ready(Err(WriterError::Closed)),
-            WriterState::Waiting { waker, .. } => {
-                waker.replace(cx.waker().clone());
-                return Poll::Pending;
-            }
-            WriterState::Open {
-                ref mut buf,
-                ref mut out,
-                ..
-            } => match buf.take() {
-                None => Poll::Ready(Ok(())),
-                Some(next) => {
-                    let callback = out.take().unwrap();
-                    if let Err(_) = callback.send(next) {
-                        return Poll::Ready(Err(WriterError::PollingError));
-                    }
-                    return Poll::Ready(Ok(()));
-                }
-            },
+        if self.buf.is_none() {
+            return Poll::Ready(Ok(()));
         }
+        // WE ASSUME buf is only full IF OPENED, since ready method guards
+        assert!(matches!(self.state, WriterState::Open { .. }));
+
+        if let Some(callback) = self.as_mut().project().state.flush(Instant::now())? {
+            if let Some(next) = self.as_mut().project().buf.take() {
+                if let Err(_) = callback.send(next) {
+                    return Poll::Ready(Err(WriterError::PollingError));
+                }
+            } else {
+                // Handle empty flush?
+                todo!()
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -396,10 +396,12 @@ where
 mod tests_writer {
     use futures::stream::empty;
     use futures::task::noop_waker_ref;
-    use futures::{pin_mut, stream};
+    use futures::{pin_mut, stream, Future, Sink};
     use futures::{stream::pending, SinkExt};
     use std::task::{ready, Context, Poll};
+    use tokio::pin;
     use tokio::sync::oneshot;
+    use tokio_stream::StreamExt;
     use tokio_test::{assert_ok, assert_pending, assert_ready_err, assert_ready_ok};
 
     use super::{Callback, Writer, WriterError};
@@ -411,94 +413,79 @@ mod tests_writer {
         };
     }
 
-    //    #[test]
-    //    fn writer_ready_no_poll_should_be_pending() {
-    //        let mut cx = Context::from_waker(noop_waker_ref());
-    //        let mut sut = Writer::new(pending::<TestResponse>());
-    //
-    //        // return Pending when no poll req
-    //        let result = sut.poll_ready_unpin(&mut cx);
-    //        assert_pending!(result)
-    //    }
-    //
-    //    #[test]
-    //    fn writer_ready() {
-    //        let mut cx = Context::from_waker(noop_waker_ref());
-    //        let p1 = test_callback!();
-    //        let inner = stream::iter(vec![p1.0]);
-    //
-    //        // should be ready
-    //        let mut sut = Writer::new(inner);
-    //        let result = sut.poll_ready_unpin(&mut cx);
-    //        assert_ready_ok!(result)
-    //    }
-    //
-    //    #[test]
-    //    fn writer_ready_double_poll() {
-    //        let mut cx = Context::from_waker(noop_waker_ref());
-    //        let p1 = test_callback!();
-    //        let p2 = test_callback!();
-    //        let inner = stream::iter(vec![p1.0, p2.0]);
-    //
-    //        let mut sut = Writer::new(inner);
-    //
-    //        // Polling x2 will result in polling error
-    //        let _ = sut.poll_ready_unpin(&mut cx);
-    //        let result = sut.poll_ready_unpin(&mut cx);
-    //        let result = assert_ready_err!(result);
-    //        assert!(
-    //            matches!(result, WriterError::PollingError),
-    //            "got {:?}",
-    //            result
-    //        );
-    //    }
-    //
-    //    #[test]
-    //    fn writer_ready_double_poll_with_data() {
-    //        let mut cx = Context::from_waker(noop_waker_ref());
-    //        let p1 = test_callback!();
-    //        let p2 = test_callback!();
-    //        let inner = stream::iter(vec![p1.0, p2.0]);
-    //
-    //        let mut sut = Writer::new(inner);
-    //        assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
-    //
-    //        let send_result = sut.start_send_unpin(Some(()));
-    //        assert_ok!(send_result, "send data");
-    //
-    //        let result = sut.poll_ready_unpin(&mut cx);
-    //        let _ = assert_ready_ok!(result);
-    //    }
-    //
-    //    #[test]
-    //    fn writer_client_stream_close() {
-    //        let mut cx = Context::from_waker(noop_waker_ref());
-    //        let mut sut = Writer::new(empty::<TestResponse>());
-    //        let result = sut.poll_ready_unpin(&mut cx);
-    //        let result = assert_ready_err!(result);
-    //        assert!(matches!(result, WriterError::Closed));
-    //    }
-    //
-    //    #[test]
-    //    fn writer_close_with_pending_data() {
-    //        let mut cx = Context::from_waker(noop_waker_ref());
-    //        let mut p1 = test_callback!();
-    //        let inner = stream::iter(vec![p1.0]);
-    //
-    //        let mut sut = Writer::new(inner);
-    //
-    //        // Send data but don't flush
-    //        assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
-    //        assert_ok!(sut.start_send_unpin(Some(())), "send data");
-    //
-    //        // Close should try to flush pending data first
-    //        let close_result = sut.poll_close_unpin(&mut cx);
-    //        assert_ready_ok!(close_result);
-    //
-    //        // Verify data was sent through callback
-    //        let received = assert_ok!(p1.1.try_recv());
-    //        assert_ok!(received, "callback received data");
-    //    }
+    #[tokio::test]
+    async fn writer_ready_no_poll_should_be_pending() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let sut = Writer::new(pending::<TestResponse>());
+        pin!(sut);
+        // return Pending when no poll re
+        let result = sut.poll_ready(&mut cx);
+        assert_pending!(result)
+    }
+
+    #[tokio::test]
+    async fn writer_ready() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let p1 = test_callback!();
+        let inner = stream::iter(vec![p1.0]).chain(stream::pending());
+
+        // should be ready
+        let sut = Writer::new(inner);
+        pin!(sut);
+        let res = sut.as_mut().poll(&mut cx);
+        assert_ready_ok!(sut.poll_ready(&mut cx))
+    }
+
+    #[tokio::test]
+    async fn writer_ready_double_poll() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let p1 = test_callback!();
+        let p2 = test_callback!();
+        let inner = stream::iter(vec![p1.0, p2.0]).chain(stream::pending());
+
+        let sut = Writer::new(inner);
+        pin!(sut);
+        let res = sut.as_mut().poll(&mut cx);
+        let result = sut.poll_ready_unpin(&mut cx);
+        let result = assert_ready_err!(result);
+        assert!(matches!(result, WriterError::Closed), "got {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn writer_client_stream_close() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let sut = Writer::new(empty::<TestResponse>());
+        pin!(sut);
+        let res = sut.as_mut().poll(&mut cx);
+        let result = sut.poll_ready_unpin(&mut cx);
+        let result = assert_ready_err!(result);
+        assert!(matches!(result, WriterError::Closed));
+    }
+
+    #[tokio::test]
+    async fn writer_close_with_pending_data() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut p1 = test_callback!();
+        let inner = stream::iter(vec![p1.0]).chain(stream::pending());
+
+        let sut = Writer::new(inner);
+        pin!(sut);
+
+        // Poll the future to process the stream and transition to Open state
+        let _ = sut.as_mut().poll(&mut cx);
+
+        // Send data but don't flush
+        assert_ready_ok!(sut.poll_ready_unpin(&mut cx));
+        assert_ok!(sut.start_send_unpin(Some(())), "send data");
+
+        // Close should try to flush pending data first
+        let close_result = sut.poll_close_unpin(&mut cx);
+        assert_ready_ok!(close_result);
+
+        // Verify data was sent through callback
+        let received = assert_ok!(p1.1.try_recv());
+        assert_ok!(received, "callback received data");
+    }
     //
     //    #[test]
     //    fn writer_close_during_active_poll() {
@@ -559,30 +546,355 @@ mod tests_writer {
 }
 
 #[cfg(test)]
-mod test_response_framer {
+mod tests_writer_state {
     use super::*;
-    use futures::task::noop_waker_ref;
-    use futures::{pin_mut, stream};
-    use std::task::Context;
     use tokio::sync::oneshot;
-    use tokio_stream::StreamExt;
-    use tokio_test::{assert_ok, assert_pending, assert_ready_ok};
 
-    #[derive(Debug, Default)]
-    struct TestData(());
+    type TestCallback = oneshot::Sender<String>;
 
-    impl Foldable for TestData {
-        type Start = Self;
+    fn make_test_callback() -> TestCallback {
+        let (tx, _rx) = oneshot::channel();
+        tx
+    }
 
-        fn append(current: &mut Self::Start, value: Self) -> TotalSize {
-            0
+    fn make_instant() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    #[test]
+    fn waiting_state_pending_within_timeout() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::new(now);
+
+        let event = state.do_io(Poll::Pending, now + Duration::from_secs(30));
+
+        match event {
+            Ok(WriterEvent::Wait(Some(deadline))) => {
+                assert_eq!(deadline, now + Duration::from_secs(60));
+            }
+            _ => panic!("Expected Ok(Wait) event with deadline"),
+        }
+
+        match state {
+            WriterState::Waiting { since, .. } => assert_eq!(since, now),
+            _ => panic!("Expected to remain in Waiting state"),
         }
     }
 
-    macro_rules! test_callback {
-        () => {
-            oneshot::channel::<std::result::Result<TestData, WriterError>>()
-        };
+    #[test]
+    fn waiting_state_pending_timeout_exceeded() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::new(now);
+
+        let event = state.do_io(Poll::Pending, now + Duration::from_secs(61));
+
+        match event {
+            Err(WriterError::PollingError) => {}
+            _ => panic!("Expected PollingError due to timeout"),
+        }
     }
-    type TestResponse = Callback<Result<TestData>>;
+
+    #[test]
+    fn waiting_state_ready_some_timeout_exceeded_returns_error() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::new(now);
+        let callback = make_test_callback();
+
+        // Even though we have a ready callback, timeout exceeded should return error
+        let event = state.do_io(Poll::Ready(Some(callback)), now + Duration::from_secs(61));
+
+        match event {
+            Err(WriterError::PollingError) => {}
+            _ => panic!("Expected PollingError due to timeout"),
+        }
+    }
+
+    #[test]
+    fn waiting_state_ready_none_timeout_exceeded_returns_error() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::new(now);
+
+        // Even though we have stream closure, timeout exceeded should return timeout error
+        let event = state.do_io(Poll::Ready(None), now + Duration::from_secs(61));
+
+        match event {
+            Err(WriterError::PollingError) => {}
+            _ => panic!("Expected PollingError due to timeout (not stream closure)"),
+        }
+    }
+
+    #[test]
+    fn waiting_state_ready_some_transitions_to_open() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::new(now);
+        let callback = make_test_callback();
+
+        let event = state.do_io(Poll::Ready(Some(callback)), now + Duration::from_secs(10));
+
+        match event {
+            Ok(WriterEvent::Wait(None)) => {}
+            _ => panic!("Expected Ok(Wait) event with no deadline"),
+        }
+
+        match state {
+            WriterState::Open { since, buf, out } => {
+                assert_eq!(since, now + Duration::from_secs(10));
+                assert_eq!(buf, 0);
+                assert!(out.is_some());
+            }
+            _ => panic!("Expected transition to Open state"),
+        }
+    }
+
+    #[test]
+    fn waiting_state_ready_none_transitions_to_closed() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::new(now);
+
+        let event = state.do_io(Poll::Ready(None), now + Duration::from_secs(10));
+
+        match event {
+            Ok(WriterEvent::Closed) => {}
+            _ => panic!("Expected Ok(Closed) event"),
+        }
+
+        match state {
+            WriterState::Closed => {}
+            _ => panic!("Expected transition to Closed state"),
+        }
+    }
+
+    #[test]
+    fn open_state_pending_within_timeout_no_buffer() {
+        let now = make_instant();
+        let callback = make_test_callback();
+        let mut state = WriterState::Open {
+            since: now,
+            buf: 0,
+            out: Some(callback),
+        };
+
+        let event = state.do_io(Poll::Pending, now + Duration::from_secs(30));
+
+        match event {
+            Ok(WriterEvent::Wait(Some(deadline))) => {
+                assert_eq!(deadline, now + Duration::from_secs(60));
+            }
+            _ => panic!("Expected Ok(Wait) event with deadline"),
+        }
+
+        match state {
+            WriterState::Open { since, buf, out } => {
+                assert_eq!(since, now);
+                assert_eq!(buf, 0);
+                assert!(out.is_some());
+            }
+            _ => panic!("Expected to remain in Open state"),
+        }
+    }
+
+    #[test]
+    fn open_state_pending_timeout_exceeded_with_buffer_returns_error() {
+        let now = make_instant();
+        let callback = make_test_callback();
+        let mut state = WriterState::Open {
+            since: now,
+            buf: 1, // Has buffer
+            out: Some(callback),
+        };
+
+        let event = state.do_io(Poll::Pending, now + Duration::from_secs(61));
+
+        match event {
+            Err(WriterError::PollingTimeout) => {}
+            _ => panic!("Expected PollingTimeout error when timeout exceeded with buffer"),
+        }
+
+        // State should remain Open - caller handles callback and state transition
+        match state {
+            WriterState::Open { since, buf, out } => {
+                assert_eq!(since, now);
+                assert_eq!(buf, 1);
+                assert!(out.is_some());
+            }
+            _ => panic!("Expected to remain in Open state"),
+        }
+    }
+
+    #[test]
+    fn open_state_pending_with_buffer_no_timeout_stays_open() {
+        let now = make_instant();
+        let callback = make_test_callback();
+        let mut state = WriterState::Open {
+            since: now,
+            buf: 1,
+            out: Some(callback),
+        };
+
+        let event = state.do_io(Poll::Pending, now + Duration::from_secs(30)); // Within timeout
+
+        match event {
+            Ok(WriterEvent::Wait(Some(deadline))) => {
+                assert_eq!(deadline, now + Duration::from_secs(60));
+            }
+            _ => panic!("Expected Ok(Wait) event with original deadline"),
+        }
+
+        match state {
+            WriterState::Open { since, buf, out } => {
+                assert_eq!(since, now);
+                assert_eq!(buf, 1);
+                assert!(out.is_some());
+            }
+            _ => panic!("Expected to remain in Open state"),
+        }
+    }
+
+    #[test]
+    fn open_state_ready_some_returns_error() {
+        let now = make_instant();
+        let callback = make_test_callback();
+        let new_callback = make_test_callback();
+        let mut state = WriterState::Open {
+            since: now,
+            buf: 0,
+            out: Some(callback),
+        };
+
+        let event = state.do_io(
+            Poll::Ready(Some(new_callback)),
+            now + Duration::from_secs(10),
+        );
+
+        match event {
+            Err(WriterError::PollingError) => {}
+            _ => panic!("Expected PollingError for multiple requests"),
+        }
+
+        // State should remain Open with new callback stored
+        match state {
+            WriterState::Open { since, buf, out } => {
+                assert_eq!(since, now);
+                assert_eq!(buf, 0);
+                assert!(out.is_some());
+            }
+            _ => panic!("Expected to remain in Open state"),
+        }
+    }
+
+    #[test]
+    fn open_state_ready_none_transitions_to_closed() {
+        let now = make_instant();
+        let callback = make_test_callback();
+        let mut state = WriterState::Open {
+            since: now,
+            buf: 0,
+            out: Some(callback),
+        };
+
+        let event = state.do_io(Poll::Ready(None), now + Duration::from_secs(10));
+
+        match event {
+            Ok(WriterEvent::Closed) => {}
+            _ => panic!("Expected Ok(Closed) event"),
+        }
+
+        match state {
+            WriterState::Closed => {}
+            _ => panic!("Expected transition to Closed state"),
+        }
+    }
+
+    #[test]
+    fn closed_state_remains_closed() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::Closed;
+
+        // Test all possible inputs
+        let inputs = [
+            Poll::Pending,
+            Poll::Ready(Some(make_test_callback())),
+            Poll::Ready(None),
+        ];
+
+        for input in inputs {
+            let event = state.do_io(input, now);
+
+            match event {
+                Ok(WriterEvent::Closed) => {}
+                _ => panic!("Expected Ok(Closed) event for closed state"),
+            }
+
+            match state {
+                WriterState::Closed => {}
+                _ => panic!("Expected to remain in Closed state"),
+            }
+        }
+    }
+
+    #[test]
+    fn close_method_from_waiting_state() {
+        let now = make_instant();
+        let mut state = WriterState::<TestCallback>::new(now);
+
+        let callback = state.close();
+
+        match state {
+            WriterState::Closed => {}
+            _ => panic!("Expected transition to Closed state after close()"),
+        }
+
+        assert!(callback.is_none(), "Waiting state should not have callback");
+    }
+
+    #[test]
+    fn close_method_from_open_state() {
+        let now = make_instant();
+        let callback = make_test_callback();
+        let mut state = WriterState::Open {
+            since: now,
+            buf: 0,
+            out: Some(callback),
+        };
+
+        let returned_callback = state.close();
+
+        match state {
+            WriterState::Closed => {}
+            _ => panic!("Expected transition to Closed state after close()"),
+        }
+
+        assert!(
+            returned_callback.is_some(),
+            "Open state should return callback"
+        );
+    }
+
+    #[test]
+    fn close_method_on_already_closed_state() {
+        let mut state = WriterState::<TestCallback>::Closed;
+
+        let callback = state.close(); // Should be a no-op
+
+        match state {
+            WriterState::Closed => {}
+            _ => panic!("Expected to remain in Closed state"),
+        }
+
+        assert!(callback.is_none(), "Closed state should not have callback");
+    }
+
+    #[test]
+    fn new_creates_waiting_state() {
+        let now = make_instant();
+        let state = WriterState::<TestCallback>::new(now);
+
+        match state {
+            WriterState::Waiting { since, waker } => {
+                assert_eq!(since, now);
+                assert!(waker.is_none());
+            }
+            _ => panic!("Expected new() to create Waiting state"),
+        }
+    }
 }
