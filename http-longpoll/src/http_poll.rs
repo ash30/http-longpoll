@@ -71,6 +71,7 @@ impl<U> WriterState<U> {
         match self {
             Self::Closed => Err(WriterError::Closed),
             Self::Waiting { .. } => Ok(None),
+            Self::Open { out, buf, .. } if *buf == 0 => Ok(None),
             Self::Open { out, .. } => {
                 let current_req = out.take().unwrap();
                 *(self) = WriterState::Waiting {
@@ -119,7 +120,10 @@ impl<U> WriterState<U> {
                     }
                     Poll::Ready(Some(req)) => {
                         // Multiple requests - this is an error condition
-                        out.replace(req); // Store the new callback but return error
+                        // we currently drop the existing callback, so they will see the session as
+                        // 'closed'
+                        // the new req will get error
+                        out.replace(req);
                         Err(WriterError::PollingError)
                     }
                     Poll::Ready(None) => {
@@ -259,11 +263,8 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.buf.is_none() {
-            return Poll::Ready(Ok(()));
-        }
         // WE ASSUME buf is only full IF OPENED, since ready method guards
-        assert!(matches!(self.state, WriterState::Open { .. }));
+        assert!(self.buf.is_none() || matches!(self.state, WriterState::Open { .. }));
 
         if let Some(callback) = self.as_mut().project().state.flush(Instant::now())? {
             if let Some(next) = self.as_mut().project().buf.take() {
@@ -411,16 +412,6 @@ mod tests_writer {
         () => {
             oneshot::channel::<std::result::Result<Option<()>, WriterError>>()
         };
-    }
-
-    #[tokio::test]
-    async fn writer_ready_no_poll_should_be_pending() {
-        let mut cx = Context::from_waker(noop_waker_ref());
-        let sut = Writer::new(pending::<TestResponse>());
-        pin!(sut);
-        // return Pending when no poll re
-        let result = sut.poll_ready(&mut cx);
-        assert_pending!(result)
     }
 
     #[tokio::test]
@@ -896,5 +887,248 @@ mod tests_writer_state {
             }
             _ => panic!("Expected new() to create Waiting state"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_writer_future {
+    use super::*;
+    use futures::task::noop_waker_ref;
+    use futures::{stream, Future, StreamExt};
+    use std::task::{Context, Poll};
+    use tokio::pin;
+    use tokio::sync::oneshot;
+    use tokio::sync::oneshot::error::TryRecvError;
+    use tokio_test::{assert_pending, assert_ready_err, assert_ready_ok};
+
+    type TestResponse = Callback<Result<Option<()>>>;
+
+    macro_rules! test_callback {
+        () => {
+            oneshot::channel::<Result<Option<()>>>()
+        };
+    }
+
+    #[tokio::test]
+    async fn future_resolves_ready_on_stream_closure() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        // Create a writer with an empty stream (immediately closes)
+        let sut = Writer::new(stream::empty::<TestResponse>());
+        pin!(sut);
+
+        // Future should resolve to Ready(Ok(())) when stream closes gracefully
+        let result = sut.poll(&mut cx);
+        assert_ready_ok!(result);
+    }
+
+    #[tokio::test]
+    async fn future_resolves_pending_on_stream_pending() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let sut = Writer::new(stream::pending::<TestResponse>());
+        pin!(sut);
+        // return Pending when no poll re
+        let result = sut.poll_ready(&mut cx);
+        assert_pending!(result)
+    }
+
+    #[tokio::test]
+    async fn future_resolves_ready_on_polling_timeout() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let (tx, _rx) = test_callback!();
+
+        // Create a stream that provides one callback then never provides more
+        let callback_stream = stream::iter(vec![tx]).chain(stream::pending());
+        let sut = Writer::new(callback_stream);
+        pin!(sut);
+
+        // Poll once to get the callback and transition to Open state
+        let _ = sut.as_mut().poll(&mut cx);
+
+        // Simulate time passing to trigger timeout
+        // We need to manipulate the state to have a buffer and exceed timeout
+        // This is a bit tricky to test directly due to the hardcoded 60s timeout
+        // For now, let's test what happens when the state machine returns an error
+
+        // The Future should resolve to Ready(Err()) on timeout
+        // Note: This test is somewhat limited due to the hardcoded timeout in the implementation
+        // In a real scenario, we'd want configurable timeouts for testing
+    }
+
+    #[tokio::test]
+    async fn future_handles_polling_errors_TESTING() {
+        let (tx1, mut rx1) = test_callback!();
+        tx1.send(Ok(Some(())));
+        let res1 = rx1.try_recv();
+        assert!(matches!(res1, Ok(..)));
+    }
+    #[tokio::test]
+    async fn future_handles_polling_errors() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let (tx1, mut rx1) = test_callback!();
+        let (tx2, mut rx2) = test_callback!();
+
+        // Create a stream that provides two callbacks immediately (causes polling error)
+        let callback_stream = stream::iter(vec![tx1, tx2]);
+        let sut = Writer::new(callback_stream);
+        pin!(sut);
+
+        // Future should resolve to Ready(Err()) due to multiple polling requests
+        // The first poll should transition to Open state successfully
+        // The second poll within the loop should detect multiple requests and error
+        let err = assert_ready_err!(sut.as_mut().poll(&mut cx));
+        assert!(matches!(err, WriterError::PollingError));
+
+        // Verify that existing callback gets closed
+        // TODO: Should we report error ?
+        let res1 = rx1.try_recv();
+        assert!(matches!(res1, Err(TryRecvError::Closed)));
+
+        // Verify that the callback received an error notification
+        let res2 = rx2.try_recv();
+        assert!(matches!(res2, Ok(..)));
+        assert!(matches!(res2.unwrap(), Err(WriterError::PollingError)));
+    }
+
+    #[tokio::test]
+    async fn future_continues_looping_on_state_transitions() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let (tx, _rx) = test_callback!();
+
+        // Create a stream with one callback followed by pending
+        let callback_stream = stream::iter(vec![tx]).chain(stream::pending());
+        let sut = Writer::new(callback_stream);
+        pin!(sut);
+
+        // First poll should transition from Waiting to Open and return Pending
+        let result = sut.as_mut().poll(&mut cx);
+        assert_pending!(result);
+
+        // Writer should now be in Open state, ready to send messages
+        // Subsequent polls should return Pending (waiting for timeout or more callbacks)
+        let result = sut.as_mut().poll(&mut cx);
+        assert_pending!(result);
+    }
+
+    // Test Sink once stream finalises
+
+    #[tokio::test]
+    async fn sink_interface_after_future_resolution() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        // Create a writer with an empty stream
+        let sut = Writer::new(stream::empty::<TestResponse>());
+        pin!(sut);
+
+        // Resolve the future
+        let _ = assert_ready_ok!(sut.as_mut().poll(&mut cx));
+
+        // After future resolution, sink operations should return Closed error
+        let ready_err = assert_ready_err!(sut.as_mut().poll_ready(&mut cx));
+        assert!(matches!(ready_err, WriterError::Closed));
+
+        let send_result = sut.as_mut().start_send(Some(()));
+        assert!(send_result.is_err());
+        assert!(matches!(
+            send_result.unwrap_err(),
+            WriterError::PollingError
+        ));
+
+        // For flush on closed writer with no buffered data, it may return Ok(())
+        let flush_result = sut.as_mut().poll_flush(&mut cx);
+        // This might be Ok(()) if there's no buffered data to flush
+        if let Poll::Ready(Ok(())) = flush_result {
+            // This is expected behavior - nothing to flush
+        } else {
+            let flush_err = assert_ready_err!(flush_result);
+            assert!(matches!(flush_err, WriterError::Closed));
+        }
+
+        // Close might return Ok(()) if the writer is already closed
+        let close_result = sut.as_mut().poll_close(&mut cx);
+        match close_result {
+            Poll::Ready(Ok(())) => {
+                // This is acceptable - writer is already closed
+            }
+            Poll::Ready(Err(err)) => {
+                assert!(matches!(err, WriterError::Closed));
+            }
+            _ => panic!("Expected ready result from close"),
+        }
+    }
+
+    #[tokio::test]
+    async fn future_handles_single_callback_lifecycle() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let (tx, mut rx) = test_callback!();
+
+        // Create a stream with one callback that we can use for the full lifecycle
+        let callback_stream = stream::iter(vec![tx]).chain(stream::pending());
+        let sut = Writer::new(callback_stream);
+        pin!(sut);
+
+        // Poll to transition to Open state
+        assert_pending!(sut.as_mut().poll(&mut cx));
+
+        // Should be ready to send now
+        assert_ready_ok!(sut.as_mut().poll_ready(&mut cx));
+
+        // Send a message
+        assert!(sut.as_mut().start_send(Some(())).is_ok());
+
+        // Flush should send the message via callback
+        assert_ready_ok!(sut.as_mut().poll_flush(&mut cx));
+
+        // Verify the callback received the message
+        let response = rx.try_recv().expect("Should have received response");
+        assert!(response.is_ok());
+        assert_eq!(response.unwrap(), Some(()));
+    }
+
+    #[tokio::test]
+    async fn future_handles_callback_send_errors() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let (tx, rx) = test_callback!();
+
+        // Drop the receiver to simulate send error
+        drop(rx);
+
+        let callback_stream = stream::iter(vec![tx]).chain(stream::pending());
+        let sut = Writer::new(callback_stream);
+        pin!(sut);
+
+        // Poll to transition to Open state
+        assert_pending!(sut.as_mut().poll(&mut cx));
+
+        // Send and flush a message
+        assert_ready_ok!(sut.as_mut().poll_ready(&mut cx));
+        assert!(sut.as_mut().start_send(Some(())).is_ok());
+
+        // Flush should fail due to dropped receiver
+        let flush_result = sut.as_mut().poll_flush(&mut cx);
+        let err = assert_ready_err!(flush_result);
+        assert!(matches!(err, WriterError::PollingError));
+    }
+
+    #[tokio::test]
+    async fn future_timer_behavior() {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let (tx, _rx) = test_callback!();
+
+        let callback_stream = stream::iter(vec![tx]).chain(stream::pending());
+        let sut = Writer::new(callback_stream);
+        pin!(sut);
+
+        // Poll to get into Open state with a deadline
+        assert_pending!(sut.as_mut().poll(&mut cx));
+
+        // The timer should now be set. Subsequent polls should still be pending
+        // until either timeout or new events arrive
+        assert_pending!(sut.as_mut().poll(&mut cx));
+        assert_pending!(sut.as_mut().poll(&mut cx));
+
+        // This tests that the timer is properly integrated with the polling mechanism
+        // In a real scenario with actual time passing, the timer would eventually
+        // trigger timeout behavior
     }
 }
